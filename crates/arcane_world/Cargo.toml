@@ -6,12 +6,33 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Arcane engine: arcane_world"
+description = "Arcane World: chunks, streaming, procedural generation, saves"
 
 [lib]
 name = "arcane_world"
 path = "src/lib.rs"
 
 [dependencies]
+arcane_core = { path = "../arcane_core" }
+arcane_math = { path = "../arcane_math" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ron = { workspace = true }
+postcard = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+rayon = { workspace = true }
+hashbrown = { workspace = true }
+ahash = { workspace = true }
+smallvec = { workspace = true }
+indexmap = { workspace = true }
+once_cell = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
+ron = { workspace = true }
+postcard = { workspace = true }

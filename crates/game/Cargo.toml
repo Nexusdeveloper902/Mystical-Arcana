@@ -34,7 +34,23 @@ arcane_ui = { path = "../arcane_ui" }
 arcane_vfx = { path = "../arcane_vfx" }
 log = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ron = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
+hashbrown = { workspace = true }
+ahash = { workspace = true }
+smallvec = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
+ron = { workspace = true }
+postcard = { workspace = true }
+arcane_world = { path = "../arcane_world" }
+
+[[test]]
+name = "smoke_headless"
+path = "../../Tests/smoke_headless.rs"

@@ -13,5 +13,12 @@ name = "arcane_math"
 path = "src/lib.rs"
 
 [dependencies]
+arcane_core = { path = "../arcane_core" }
+serde = { workspace = true }
+nalgebra = { workspace = true }
+bytemuck = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
+proptest = { workspace = true }
+pretty_assertions = { workspace = true }
