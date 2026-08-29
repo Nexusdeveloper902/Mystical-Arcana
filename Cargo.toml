@@ -1,0 +1,114 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arcane_core",
+    "crates/arcane_math",
+    "crates/arcane_ecs",
+    "crates/arcane_render",
+    "crates/arcane_world",
+    "crates/arcane_assets",
+    "crates/arcane_audio",
+    "crates/arcane_physics",
+    "crates/arcane_input",
+    "crates/arcane_ui",
+    "crates/arcane_vfx",
+    "crates/game",
+    "Tools/asset_pipeline",
+]
+default-members = ["crates/game"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+authors = ["Mystical Arcana Project"]
+repository = "https://github.com/Nexusdeveloper902/Mystical-Arcana"
+
+[workspace.dependencies]
+# === Logging / diagnostics ===
+log = "0.4"
+env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# === Serialization ===
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ron = "0.8"
+postcard = { version = "1", features = ["alloc"] }
+bincode = "1"
+
+# === Math ===
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+nalgebra-glm = "0.19"
+glam = { version = "0.27", features = ["serde"] }
+
+# === Error handling ===
+anyhow = "1"
+thiserror = "1"
+
+# === Concurrency ===
+rayon = "1"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+atomic_refcell = "0.1"
+
+# === Collections / utilities ===
+hashbrown = { version = "0.14", features = ["serde"] }
+ahash = "0.8"
+smallvec = { version = "1", features = ["serde", "union", "const_generics"] }
+bitflags = { version = "2", features = ["serde"] }
+bytemuck = { version = "1", features = ["derive"] }
+once_cell = "1"
+indexmap = { version = "2", features = ["serde"] }
+
+# === Rendering (Vulkan) ===
+ash = "0.37"
+ash-window = "0.12"
+winit = "0.29"
+gpu-allocator = "0.26"
+
+# === Assets ===
+gltf = { version = "1", features = ["utils"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
+meshopt = "0.2"
+
+# === Audio ===
+kira = "0.8"
+rodio = { version = "0.17", default-features = false, features = ["vorbis"] }
+
+# === Physics ===
+rapier3d = { version = "0.18", features = ["serde-serialize"] }
+
+# === Input ===
+gilrs = "0.10"
+
+# === Profiling ===
+puffin = "0.19"
+
+# === Testing ===
+proptest = "1"
+pretty_assertions = "1"
+
+[profile.dev]
+opt-level = 1
+debug = 1
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+strip = "symbols"
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 3

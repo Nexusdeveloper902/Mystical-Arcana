@@ -1,0 +1,17 @@
+[package]
+name = "arcane_render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Arcane engine: arcane_render"
+
+[lib]
+name = "arcane_render"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]

@@ -1,0 +1,40 @@
+[package]
+name = "game"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Mystical Arcana — game logic and main binary"
+
+[lib]
+name = "mystical_arcana_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mystical_arcana"
+path = "src/main.rs"
+
+[features]
+default = []
+headless = []
+
+[dependencies]
+arcane_core = { path = "../arcane_core" }
+arcane_math = { path = "../arcane_math" }
+arcane_ecs  = { path = "../arcane_ecs" }
+arcane_render = { path = "../arcane_render" }
+arcane_world = { path = "../arcane_world" }
+arcane_assets = { path = "../arcane_assets" }
+arcane_audio = { path = "../arcane_audio" }
+arcane_physics = { path = "../arcane_physics" }
+arcane_input = { path = "../arcane_input" }
+arcane_ui = { path = "../arcane_ui" }
+arcane_vfx = { path = "../arcane_vfx" }
+log = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+pretty_assertions = { workspace = true }

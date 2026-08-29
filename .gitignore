@@ -1,0 +1,69 @@
+# ===== Secrets / credentials — NEVER commit any of these =====
+.env
+.env.*
+*.pem
+*.key
+secrets/
+credentials/
+*token*
+*Token*
+*TOKEN*
+gh-token*
+gh_token*
+github_token*
+*_PAT*
+*.pat
+
+# ===== Rust =====
+target/
+**/*.rs.bk
+*.rs.bk
+Cargo.lock.bak
+
+# ===== CMake / build artifacts =====
+build/
+build-*/
+cmake-build-*/
+out/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# ===== Editor / IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Asset pipeline intermediate =====
+cooked/
+intermediate/
+*.tmp
+*.bak
+
+# ===== Save data / runtime state =====
+saves/
+*.save
+*.sav
+logs/
+*.log
+
+# ===== OS junk =====
+*.DS_Store
+__pycache__/
+*.pyc
