@@ -120,7 +120,9 @@ where
     R: Send + 'static,
 {
     handle: Option<JoinHandle<()>>,
-    tx: Sender<J>,
+    // Stored as Option so the Drop impl can take it before joining the thread.
+    // Without this, the channel stays open during join() and the worker never exits.
+    tx: Option<Sender<J>>,
     rx: Receiver<R>,
 }
 
@@ -148,12 +150,14 @@ where
                 }
             })
             .expect("background worker spawn");
-        Self { handle: Some(handle), tx: job_tx, rx: res_rx }
+        Self { handle: Some(handle), tx: Some(job_tx), rx: res_rx }
     }
 
     /// Enqueue a job. Blocks if the job queue is full (back-pressure).
     pub fn submit(&self, job: J) {
-        self.tx.send(job).expect("worker died")
+        if let Some(tx) = &self.tx {
+            tx.send(job).expect("worker died")
+        }
     }
 
     /// Try to receive a completed result without blocking.
@@ -177,9 +181,9 @@ where
     R: Send + 'static,
 {
     fn drop(&mut self) {
-        // Dropping the sender signals the worker to exit (the for-loop over
-        // job_rx will end).
-        // No need to explicitly close; just letting `tx` drop naturally works.
+        // Drop the sender FIRST so the worker's job_rx returns None and the
+        // loop exits. The worker will finish any in-flight job, then return.
+        self.tx.take();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }

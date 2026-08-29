@@ -110,5 +110,12 @@ lto = "thin"
 codegen-units = 1
 debug = true
 
+# Test profile: optimize the procedural/world/streaming test binaries.
+# Default `cargo test` uses opt-level=0 which is too slow for compute-heavy
+# world-generation tests. Setting opt-level=2 here gives the procedural
+# generator a ~10-30x speedup at the cost of slightly slower test compilation.
+[profile.test]
+opt-level = 2
+
 [profile.dev.package."*"]
 opt-level = 3

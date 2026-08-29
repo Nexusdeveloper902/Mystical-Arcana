@@ -169,6 +169,26 @@ version = "0.1.0"
 [[package]]
 name = "arcane_world"
 version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "arcane_core",
+ "arcane_math",
+ "crossbeam-channel",
+ "hashbrown 0.14.5",
+ "indexmap",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "postcard",
+ "pretty_assertions",
+ "proptest",
+ "rayon",
+ "ron",
+ "serde",
+ "serde_json",
+ "smallvec",
+]
 
 [[package]]
 name = "asset_pipeline"
