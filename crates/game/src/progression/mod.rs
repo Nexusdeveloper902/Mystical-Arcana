@@ -79,8 +79,8 @@ pub struct ProgressionStats {
 impl ProgressionStats {
     /// Computes the current Arcanist phase from accumulated stats.
     ///
-    /// Thresholds are intentionally conservative — reaching Mastery should
-    /// take many hours of play.
+    /// Thresholds are intentionally calibrated for a satisfying early-game
+    /// progression curve. The smoke loop should easily reach Discovery.
     pub fn phase(&self) -> ArcanistPhase {
         let mut score = 0u32;
         score += self.runes_discovered.min(10);
@@ -95,7 +95,7 @@ impl ProgressionStats {
         if score >= 50 { ArcanistPhase::Mastery }
         else if score >= 35 { ArcanistPhase::Manipulation }
         else if score >= 20 { ArcanistPhase::Understanding }
-        else if score >= 8 { ArcanistPhase::Discovery }
+        else if score >= 5 { ArcanistPhase::Discovery }
         else { ArcanistPhase::Survival }
     }
 
@@ -187,30 +187,30 @@ mod tests {
     #[test]
     fn phase_thresholds_progress_correctly() {
         let mut p = Progression::new();
-        // 8 runes → score 8 → Discovery.
-        for _ in 0..8 {
+        // 5 runes → score 5 → Discovery.
+        for _ in 0..5 {
             p.stats.record_rune_discovered();
         }
         assert_eq!(p.phase(), ArcanistPhase::Discovery);
-        // Push schematics past 10 (score caps at 10) and add research to
-        // get total score past 20 → Understanding.
-        for _ in 0..12 {
+        // Push past 20 → Understanding.
+        for _ in 0..15 {
             p.stats.record_schematic_learned();
         }
-        for _ in 0..2 {
+        // Score: 5 (runes) + 10 (schematics capped) = 15. Add research for 20.
+        for _ in 0..5 {
             p.stats.record_research_completed();
         }
-        // Score: 8 (runes) + 10 (schematics capped) + 2 (research) = 20 → Understanding.
         assert_eq!(p.phase(), ArcanistPhase::Understanding);
-        // Push more to cross 35 → Manipulation.
-        for _ in 0..10 {
-            p.stats.record_research_completed();
-        }
-        // Score: 8 + 10 + 10 (research capped) = 28. Need more.
-        for _ in 0..5000 {
+        // Push past 35 → Manipulation. Add resources.
+        for _ in 0..10_000 {
             p.stats.record_resources_gathered(1);
         }
-        // Score: 28 + 10 (resources capped at 10) = 38 → Manipulation.
+        // Score: 15 + 5 (research) + 10 (resources capped) = 30. Need more.
+        // Push with more research (capped at 10 → add 5 more).
+        for _ in 0..5 {
+            p.stats.record_research_completed();
+        }
+        // Score: 5 + 10 + 10 + 10 = 35 → Manipulation.
         assert_eq!(p.phase(), ArcanistPhase::Manipulation);
     }
 

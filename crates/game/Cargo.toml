@@ -49,3 +49,8 @@ pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
 ron = { workspace = true }
 postcard = { workspace = true }
+arcane_world = { path = "../arcane_world" }
+
+[[test]]
+name = "smoke_headless"
+path = "../../Tests/smoke_headless.rs"
