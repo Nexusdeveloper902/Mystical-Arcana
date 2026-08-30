@@ -216,3 +216,24 @@ Stage Summary:
 - main.rs scene composition is ECS-driven: 8 entities, 7 spinning. Per-frame system advances rotations and builds the scene slice for the renderer.
 - 20-frame smoke test: "ECS scene: 8 entities, 7 spinning", renders cleanly with no validation errors.
 - Phase H committed on local main, pushed to origin/renderer-vulkan.
+
+---
+Task ID: 8-shader-hotreload
+Agent: main (super-z)
+Task: Phase I — Shader hot-reload via SPIR-V file-watching.
+
+Work Log:
+- Added `load_shader_from_disk(ctx, path) -> vk::ShaderModule` helper that reads a .spv file from disk, validates the SPIR-V magic number (0x07230203), and creates a shader module. Distinct from `load_shader` (which reads from rust-embed'd embedded bytes) so the runtime can pick up files recompiled after the binary was built.
+- Added `ShaderWatcher` struct that polls `dir/*.spv` mtimes on each call to `changed()`. Returns true if any file's mtime advanced or if files were added/removed. Polling is stat() per file (~10 µs total for our 4 .spv files) — negligible next to a single Vulkan frame, and avoids pulling the `notify` crate.
+- Added `Pipeline::reload_shaders_from_disk(ctx, vert_path, frag_path, extent)` method that:
+  1. Builds new vert + frag shader modules from disk bytes (validates SPIR-V magic).
+  2. Constructs a new GraphicsPipelineCreateInfo with the existing pipeline_layout + render_pass + descriptor_set_layout (these don't depend on shader code, so they're reused; the framebuffers stay valid because the render_pass is preserved).
+  3. Calls device_wait_idle, destroys the old pipeline + vert_module + frag_module, then creates the new pipeline + assigns new modules.
+- Added `Backend::hotreload_if_changed(watcher, vert_name, frag_name) -> RenderResult<bool>` that calls `watcher.changed()` and, if true, calls `pipeline.reload_shaders_from_disk` with the watcher's directory + the supplied shader names. Logs the reload attempt and surfaces errors.
+- Wired hot-reload into main.rs behind `MYSTICAL_HOTRELOAD=1` env var. Reads `MYSTICAL_SHADER_DIR` (default `crates/arcane_render/shaders/spirv`). Constructs `ShaderWatcher` if enabled. Per-frame call to `hotreload_if_changed` inside the render loop, before the ECS advance step.
+- Verified the build is clean, the watcher construction succeeds, and the binary runs without crashing when hot-reload is enabled (15-frame smoke test, no validation errors).
+
+Stage Summary:
+- Hot-reload path is fully wired: load_shader_from_disk, ShaderWatcher (polling), Pipeline::reload_shaders_from_disk, Backend::hotreload_if_changed, main.rs env-var gating.
+- 15-frame smoke test with hot-reload enabled: no validation errors, no crashes. The watcher correctly identifies when .spv files are unchanged (returns false, no reload attempt).
+- Phase I committed on local main, pushed to origin/renderer-vulkan.

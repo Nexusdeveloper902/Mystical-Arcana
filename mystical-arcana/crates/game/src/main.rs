@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use arcane_ecs::World;
-use arcane_render::{validation_failed, Backend, MeshKind, SceneInstance};
+use arcane_render::{validation_failed, Backend, MeshKind, SceneInstance, ShaderWatcher};
 use arcane_world::{MeshKindComponent, Spin, Transform};
 
 /// Set to true by the SIGINT handler. The render loop polls this between
@@ -80,6 +80,17 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2000);
+    let hotreload: bool = std::env::var("MYSTICAL_HOTRELOAD")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let shader_dir = std::env::var("MYSTICAL_SHADER_DIR")
+        .unwrap_or_else(|_| "crates/arcane_render/shaders/spirv".to_string());
+    if hotreload {
+        log::info!(
+            "hot-reload ENABLED: watching {} for *.spv changes",
+            shader_dir
+        );
+    }
 
     log::info!(
         "config: size={width}x{height} frame_cap={frame_cap} forever={forever} observatory={observatory_addr} warmup_ms={warmup_ms}"
@@ -94,6 +105,15 @@ fn main() -> anyhow::Result<()> {
     log::info!("observatory: http://{observatory_addr}/");
 
     install_sigint_handler();
+
+    // Optional shader hot-reload watcher. When MYSTICAL_HOTRELOAD=1, poll
+    // the .spv directory each frame and rebuild the pipeline when any
+    // shader file's mtime advances.
+    let mut shader_watcher = if hotreload {
+        Some(ShaderWatcher::new(&shader_dir))
+    } else {
+        None
+    };
 
     // Render loop.
     let start = Instant::now();
@@ -168,6 +188,15 @@ fn main() -> anyhow::Result<()> {
     while !STOP.load(Ordering::SeqCst) {
         if !forever && frame_index >= frame_cap {
             break;
+        }
+
+        // Optional hot-reload check (no-op when watcher is None).
+        if let Some(w) = shader_watcher.as_mut() {
+            match backend.hotreload_if_changed(w, "lit_textured.vert.spv", "lit_textured.frag.spv") {
+                Ok(true) => log::info!("hot-reload applied at frame {frame_index}"),
+                Ok(false) => {},
+                Err(e) => log::warn!("hot-reload skipped at frame {frame_index}: {e:?}"),
+            }
         }
 
         // Advance the ECS: each entity with a Spin component gets its

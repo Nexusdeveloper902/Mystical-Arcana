@@ -1222,6 +1222,122 @@ pub fn load_shader(ctx: &VkContext, name: &str) -> RenderResult<vk::ShaderModule
     }
 }
 
+/// Load a SPIR-V shader module directly from disk (used by the hot-
+/// reload path — embedded shaders are a build-time snapshot; disk
+/// shaders are whatever the user just recompiled with `glslc`).
+pub fn load_shader_from_disk(ctx: &VkContext, path: &str) -> RenderResult<vk::ShaderModule> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| RenderError::Shader(format!("read {}: {}", path, e)))?;
+    if bytes.len() % 4 != 0 || bytes.len() < 8 {
+        return Err(RenderError::Shader(format!(
+            "SPIR-V file {} has bad size {} (must be multiple of 4, >= 8 bytes)",
+            path, bytes.len()
+        )));
+    }
+    // Sanity-check the SPIR-V magic number (0x07230203 in native byte order).
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if magic != 0x07230203 {
+        return Err(RenderError::Shader(format!(
+            "{}: not a SPIR-V binary (magic was {:#010x}, expected 0x07230203)",
+            path, magic
+        )));
+    }
+    let code: &[u32] = unsafe {
+        std::slice::from_raw_parts(
+            bytes.as_ptr() as *const u32,
+            bytes.len() / 4,
+        )
+    };
+    let create = vk::ShaderModuleCreateInfo::default().code(code);
+    unsafe {
+        Ok(ctx.device.create_shader_module(&create, None)
+            .map_err(|e| RenderError::Shader(format!("create_shader_module (disk): {:?}", e)))?)
+    }
+}
+
+// =============================================================================
+// Shader hot-reload watcher
+// =============================================================================
+
+/// Polling-based file watcher for SPIR-V shader files. Captures the
+/// mtimes of all `*.spv` files in `dir` at construction time, then
+/// `changed()` returns true if any of them has a newer mtime than the
+/// snapshot.
+///
+/// We poll rather than use the `notify` crate to avoid pulling another
+/// dependency for a feature that is gated behind `MYSTICAL_HOTRELOAD=1`.
+/// The poll is a stat() per file, ~10 µs per file — negligible next to
+/// a single Vulkan frame.
+pub struct ShaderWatcher {
+    dir: std::path::PathBuf,
+    snapshots: Vec<(std::path::PathBuf, std::time::SystemTime)>,
+}
+
+impl ShaderWatcher {
+    /// Create a watcher for `dir/*.spv`. Snapshots mtimes at construction
+    /// time so the first `changed()` call returns false unless the files
+    /// change after this point.
+    pub fn new(dir: impl AsRef<std::path::Path>) -> Self {
+        let dir = dir.as_ref().to_path_buf();
+        let snapshots = Self::snapshot_dir(&dir);
+        Self { dir, snapshots }
+    }
+
+    /// Read-only access to the watched directory. Used by callers
+    /// (e.g. Backend::hotreload_if_changed) to construct full paths to
+    /// individual SPIR-V files.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// Re-snapshot the directory and return true if any file's mtime
+    /// changed since the last snapshot. Also picks up newly created files.
+    pub fn changed(&mut self) -> bool {
+        let new = Self::snapshot_dir(&self.dir);
+        let mut changed = false;
+        for (path, mtime) in &new {
+            let prev = self.snapshots.iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, m)| *m);
+            match prev {
+                Some(prev_mtime) if *mtime != prev_mtime => {
+                    changed = true;
+                }
+                None => {
+                    // New file.
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        // Detect deletions too — if a snapshot file is gone, that's a change.
+        if self.snapshots.len() != new.len() {
+            changed = true;
+        }
+        if changed {
+            self.snapshots = new;
+        }
+        changed
+    }
+
+    fn snapshot_dir(dir: &std::path::Path) -> Vec<(std::path::PathBuf, std::time::SystemTime)> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("spv") {
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if let Ok(mtime) = meta.modified() {
+                            out.push((path, mtime));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 // =============================================================================
 // Depth buffer
 // =============================================================================
@@ -1594,6 +1710,158 @@ impl Pipeline {
             ctx.device.destroy_shader_module(self.vert_module, None);
             ctx.device.destroy_shader_module(self.frag_module, None);
         }
+    }
+
+    /// Hot-reload: re-read the SPIR-V files at `vert_path` / `frag_path`
+    /// from disk, then rebuild ONLY the graphics pipeline object (the
+    /// pipeline_layout + render_pass + descriptor_set_layout stay alive
+    /// because they don't depend on shader code, and the framebuffers
+    /// reference the render_pass so we can't drop it without also
+    /// recreating them).
+    ///
+    /// Caller must ensure the GPU is idle (calls device_wait_idle first).
+    /// On failure the old pipeline + shader modules are gone — we
+    /// surface the error and let the caller decide whether to rebuild
+    /// from scratch or exit.
+    pub fn reload_shaders_from_disk(
+        &mut self,
+        ctx: &VkContext,
+        vert_path: &str,
+        frag_path: &str,
+        extent: vk::Extent2D,
+    ) -> RenderResult<()> {
+        log::info!(
+            "hot-reload: vert={} frag={}",
+            vert_path, frag_path
+        );
+        // Build the new shader modules first; if either fails we abort
+        // without touching the existing pipeline.
+        let new_vert = load_shader_from_disk(ctx, vert_path)?;
+        let new_frag = load_shader_from_disk(ctx, frag_path)?;
+
+        // Reuse the existing pipeline_layout + render_pass + descriptor_set_layout.
+        // The new pipeline object will reference them.
+        let entry_name = CString::new("main").unwrap();
+        let vert_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(new_vert)
+            .name(&entry_name);
+        let frag_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(new_frag)
+            .name(&entry_name);
+        let stages = [vert_stage, frag_stage];
+
+        // Vertex input state must match what the new shaders expect.
+        // We rebuild from the same Vertex struct definition so the
+        // stride + attribute offsets are unchanged.
+        let vertex_bindings = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<Vertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let vertex_attrs = [
+            vk::VertexInputAttributeDescription::default()
+                .location(0).binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .location(1).binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(12),
+            vk::VertexInputAttributeDescription::default()
+                .location(2).binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(24),
+            vk::VertexInputAttributeDescription::default()
+                .location(3).binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(36),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attrs);
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .primitive_restart_enable(false);
+
+        let viewport = vk::Viewport::default()
+            .x(0.0).y(0.0)
+            .width(extent.width as f32)
+            .height(extent.height as f32)
+            .min_depth(0.0).max_depth(1.0);
+        let scissor = vk::Rect2D::default()
+            .offset(vk::Offset2D { x: 0, y: 0 })
+            .extent(extent);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewports(std::slice::from_ref(&viewport))
+            .scissors(std::slice::from_ref(&scissor));
+
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .line_width(1.0)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .depth_bias_enable(false);
+
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .sample_shading_enable(false)
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
+
+        let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A)
+            .blend_enable(false)];
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&color_blend_attachments);
+
+        let create = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisampling)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .layout(self.pipeline_layout)
+            .render_pass(self.render_pass)
+            .subpass(0);
+
+        // Destroy the old pipeline + modules first, then create the new one.
+        // If creation fails, we surface the error — the caller is in an
+        // inconsistent state but at least the device is idle.
+        unsafe {
+            let _ = ctx.device.device_wait_idle();
+            ctx.device.destroy_pipeline(self.pipeline, None);
+            ctx.device.destroy_shader_module(self.vert_module, None);
+            ctx.device.destroy_shader_module(self.frag_module, None);
+        }
+        let new_pipeline = unsafe {
+            ctx.device.create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(&create),
+                None,
+            ).map_err(|(_pipelines, e)| RenderError::Pipeline(format!("hot-reload create_graphics_pipelines: {:?}", e)))?[0]
+        };
+        self.pipeline = new_pipeline;
+        self.vert_module = new_vert;
+        self.frag_module = new_frag;
+        log::info!("hot-reload: pipeline rebuilt successfully");
+        Ok(())
     }
 }
 
@@ -2266,6 +2534,47 @@ impl Backend {
         let angle = (frame_index as f32) * 0.05;
         let model = Mat4::from_rotation_y(angle);
         self.render_scene(frame_index, &[SceneInstance::new(MeshKind::Cube, model)])
+    }
+
+    /// Check the shader directory for changes and reload the pipeline's
+    /// shaders from disk if any .spv file's mtime advanced. Returns
+    /// `true` if a reload happened (caller can log), `false` if no
+    /// changes detected. The vert + frag paths are derived from the
+    /// watcher's directory + fixed shader names.
+    pub fn hotreload_if_changed(
+        &mut self,
+        watcher: &mut ShaderWatcher,
+        vert_name: &str,
+        frag_name: &str,
+    ) -> RenderResult<bool> {
+        if !watcher.changed() {
+            return Ok(false);
+        }
+        // Build full paths to the vert + frag SPIR-V files.
+        let vert_path = format!(
+            "{}/{}",
+            watcher.dir().display(),
+            vert_name
+        );
+        let frag_path = format!(
+            "{}/{}",
+            watcher.dir().display(),
+            frag_name
+        );
+        // Reload. Failure here is recoverable in the sense that the
+        // pipeline_layout + render_pass + descriptor set + framebuffers
+        // are still alive; only the pipeline object + shader modules
+        // got destroyed. The caller would have to rebuild from scratch
+        // if the new pipeline creation failed.
+        match self.pipeline.reload_shaders_from_disk(
+            &self.ctx, &vert_path, &frag_path, self.swapchain.extent,
+        ) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                log::error!("hot-reload failed: {:?}", e);
+                Err(e)
+            }
+        }
     }
 
     /// Render a scene containing many cube instances, each transformed by
