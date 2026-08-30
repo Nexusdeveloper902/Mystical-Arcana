@@ -490,6 +490,13 @@ impl Buffer {
 pub struct Vertex {
     pub pos: [f32; 3],
     pub color: [f32; 3],
+    pub normal: [f32; 3],
+}
+
+impl Vertex {
+    pub fn new(pos: [f32; 3], color: [f32; 3], normal: [f32; 3]) -> Self {
+        Self { pos, color, normal }
+    }
 }
 
 pub struct TriangleMesh {
@@ -500,10 +507,11 @@ pub struct TriangleMesh {
 
 impl TriangleMesh {
     pub fn new(ctx: &VkContext) -> RenderResult<Self> {
+        // Flat triangle in the Z=0 plane, CCW winding, facing +Z.
         let vertices: [Vertex; 3] = [
-            Vertex { pos: [ 0.5, -0.5, 0.0], color: [1.0, 0.0, 0.0] },
-            Vertex { pos: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0] },
-            Vertex { pos: [ 0.0,  0.5, 0.0], color: [0.0, 0.0, 1.0] },
+            Vertex::new([ 0.5, -0.5, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            Vertex::new([-0.5, -0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            Vertex::new([ 0.0,  0.5, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]),
         ];
         let indices: [u16; 3] = [0, 1, 2];
         MeshBuilder::new(ctx)
@@ -660,8 +668,6 @@ impl CubeMesh {
         // vertex colors and normals (no shared corners). Indexed by 36
         // uint16s (2 triangles per face x 3 indices x 6 faces).
         let s = 1.0f32;
-        let (rx, gx, bx) = (1.0f32, 0.0f32, 0.0f32); // not used
-        let _ = (rx, gx, bx);
 
         // Per-face colors (sRGB-ish primaries for visual debugging):
         let c_right  = [1.0, 1.0, 0.0]; // +X = yellow
@@ -671,41 +677,49 @@ impl CubeMesh {
         let c_front  = [0.0, 1.0, 0.0]; // +Z = green
         let c_back   = [0.0, 0.0, 1.0]; // -Z = blue
 
+        // Per-face outward normals (unit vectors along each face's axis).
+        let n_right  = [ 1.0,  0.0,  0.0];
+        let n_left   = [-1.0,  0.0,  0.0];
+        let n_bottom = [ 0.0,  1.0,  0.0];
+        let n_top    = [ 0.0, -1.0,  0.0];
+        let n_front  = [ 0.0,  0.0,  1.0];
+        let n_back   = [ 0.0,  0.0, -1.0];
+
         // Vertex winding: each face is 4 verts in BL, BR, TR, TL order
         // (CCW when viewed from outside). The two triangles per face are
         // (BL, BR, TR) and (BL, TR, TL).
         let mut verts: Vec<Vertex> = Vec::with_capacity(24);
 
         // +X face (right)
-        verts.push(Vertex { pos: [ s, -s, -s], color: c_right  });
-        verts.push(Vertex { pos: [ s, -s,  s], color: c_right  });
-        verts.push(Vertex { pos: [ s,  s,  s], color: c_right  });
-        verts.push(Vertex { pos: [ s,  s, -s], color: c_right  });
+        verts.push(Vertex::new([ s, -s, -s], c_right,  n_right ));
+        verts.push(Vertex::new([ s, -s,  s], c_right,  n_right ));
+        verts.push(Vertex::new([ s,  s,  s], c_right,  n_right ));
+        verts.push(Vertex::new([ s,  s, -s], c_right,  n_right ));
         // -X face (left)
-        verts.push(Vertex { pos: [-s, -s,  s], color: c_left   });
-        verts.push(Vertex { pos: [-s, -s, -s], color: c_left   });
-        verts.push(Vertex { pos: [-s,  s, -s], color: c_left   });
-        verts.push(Vertex { pos: [-s,  s,  s], color: c_left   });
+        verts.push(Vertex::new([-s, -s,  s], c_left,   n_left  ));
+        verts.push(Vertex::new([-s, -s, -s], c_left,   n_left  ));
+        verts.push(Vertex::new([-s,  s, -s], c_left,   n_left  ));
+        verts.push(Vertex::new([-s,  s,  s], c_left,   n_left  ));
         // +Y face (bottom in Vulkan NDC)
-        verts.push(Vertex { pos: [-s,  s,  s], color: c_bottom });
-        verts.push(Vertex { pos: [-s,  s, -s], color: c_bottom });
-        verts.push(Vertex { pos: [ s,  s, -s], color: c_bottom });
-        verts.push(Vertex { pos: [ s,  s,  s], color: c_bottom });
+        verts.push(Vertex::new([-s,  s,  s], c_bottom, n_bottom));
+        verts.push(Vertex::new([-s,  s, -s], c_bottom, n_bottom));
+        verts.push(Vertex::new([ s,  s, -s], c_bottom, n_bottom));
+        verts.push(Vertex::new([ s,  s,  s], c_bottom, n_bottom));
         // -Y face (top in Vulkan NDC)
-        verts.push(Vertex { pos: [-s, -s, -s], color: c_top    });
-        verts.push(Vertex { pos: [-s, -s,  s], color: c_top    });
-        verts.push(Vertex { pos: [ s, -s,  s], color: c_top    });
-        verts.push(Vertex { pos: [ s, -s, -s], color: c_top    });
+        verts.push(Vertex::new([-s, -s, -s], c_top,    n_top   ));
+        verts.push(Vertex::new([-s, -s,  s], c_top,    n_top   ));
+        verts.push(Vertex::new([ s, -s,  s], c_top,    n_top   ));
+        verts.push(Vertex::new([ s, -s, -s], c_top,    n_top   ));
         // +Z face (front)
-        verts.push(Vertex { pos: [ s, -s,  s], color: c_front  });
-        verts.push(Vertex { pos: [-s, -s,  s], color: c_front  });
-        verts.push(Vertex { pos: [-s,  s,  s], color: c_front  });
-        verts.push(Vertex { pos: [ s,  s,  s], color: c_front  });
+        verts.push(Vertex::new([ s, -s,  s], c_front,  n_front ));
+        verts.push(Vertex::new([-s, -s,  s], c_front,  n_front ));
+        verts.push(Vertex::new([-s,  s,  s], c_front,  n_front ));
+        verts.push(Vertex::new([ s,  s,  s], c_front,  n_front ));
         // -Z face (back)
-        verts.push(Vertex { pos: [-s, -s, -s], color: c_back   });
-        verts.push(Vertex { pos: [ s, -s, -s], color: c_back   });
-        verts.push(Vertex { pos: [ s,  s, -s], color: c_back   });
-        verts.push(Vertex { pos: [-s,  s, -s], color: c_back   });
+        verts.push(Vertex::new([-s, -s, -s], c_back,   n_back  ));
+        verts.push(Vertex::new([ s, -s, -s], c_back,   n_back  ));
+        verts.push(Vertex::new([ s,  s, -s], c_back,   n_back  ));
+        verts.push(Vertex::new([-s,  s, -s], c_back,   n_back  ));
 
         // Per-face index pattern: 0,1,2,0,2,3 (relative to face base).
         let face_idx = [0u16, 1, 2, 0, 2, 3];
@@ -944,9 +958,12 @@ impl Pipeline {
                 .map_err(|e| RenderError::Pipeline(format!("create_render_pass: {:?}", e)))?
         };
 
-        // Shaders
-        let vert_module = load_shader(ctx, "tri.vert.spv")?;
-        let frag_module = load_shader(ctx, "tri.frag.spv")?;
+        // Shaders — Phase E switched to the lit.{vert,frag} pair which
+        // carry per-vertex normals and apply ambient + diffuse + rim
+        // lighting in the fragment shader. The push-constant block grew
+        // from 64 bytes (MVP only) to 128 bytes (view_proj + model).
+        let vert_module = load_shader(ctx, "lit.vert.spv")?;
+        let frag_module = load_shader(ctx, "lit.frag.spv")?;
         let entry_name = CString::new("main").unwrap();
         let vert_stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
@@ -958,6 +975,9 @@ impl Pipeline {
             .name(&entry_name);
         let stages = [vert_stage, frag_stage];
 
+        // Vertex layout: pos (12B) + color (12B) + normal (12B) = 36B.
+        // All three attributes are 4-byte aligned (vec3 of f32), so no
+        // padding is needed and the struct is bytemuck::Pod-compatible.
         let vertex_bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)
             .stride(std::mem::size_of::<Vertex>() as u32)
@@ -971,6 +991,10 @@ impl Pipeline {
                 .location(1).binding(0)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(12),
+            vk::VertexInputAttributeDescription::default()
+                .location(2).binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(24),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vertex_bindings)
@@ -1033,10 +1057,16 @@ impl Pipeline {
             .logic_op_enable(false)
             .attachments(&color_blend_attachments);
 
+        // Push constants: { view_proj: mat4, model: mat4 } = 128 bytes.
+        // This is the Vulkan-guaranteed minimum push-constant size, so the
+        // pipeline works on every conformant driver. view_proj is constant
+        // across all instances in a frame; model is per-instance. We push
+        // both together per draw call (the simpler API wins over a split
+        // push that would only save 64 bytes of bandwidth per draw).
         let pc_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
             .offset(0)
-            .size(std::mem::size_of::<[f32; 16]>() as u32)];
+            .size(std::mem::size_of::<[f32; 32]>() as u32)];
 
         let layout_create = vk::PipelineLayoutCreateInfo::default()
             .push_constant_ranges(&pc_ranges);
@@ -1706,11 +1736,19 @@ impl Backend {
         );
         let view: Mat4 = Mat4::from_translation(Vec3::new(0.0, 0.0, -5.0));
         let view_proj: Mat4 = proj * view;
-        // Precompute each instance's MVP as a [f32; 16] so the recording
-        // loop doesn't allocate or recompute per draw call.
-        let mvps: Vec<[f32; 16]> = models
+        // Precompute the per-instance push-constant payload: 32 f32s =
+        // view_proj (cols, 16) followed by model (cols, 16). The recording
+        // loop just casts each entry to a byte slice for cmd_push_constants.
+        let view_proj_cols = mat4_to_cols_array(view_proj);
+        let per_instance: Vec<[f32; 32]> = models
             .iter()
-            .map(|m| mat4_to_cols_array(view_proj * *m))
+            .map(|m| {
+                let model_cols = mat4_to_cols_array(*m);
+                let mut buf = [0.0f32; 32];
+                buf[..16].copy_from_slice(&view_proj_cols);
+                buf[16..32].copy_from_slice(&model_cols);
+                buf
+            })
             .collect();
 
         let current = self.frame.current;
@@ -1733,7 +1771,7 @@ impl Backend {
                 .map_err(|e| RenderError::Other(format!("reset_command_buffer: {:?}", e)))?;
         }
 
-        self.record_draw(cmd, image_index, &mvps)?;
+        self.record_draw(cmd, image_index, &per_instance)?;
 
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let wait_semaphores = [image_available];
@@ -1769,7 +1807,7 @@ impl Backend {
         &self,
         cmd: vk::CommandBuffer,
         image_index: u32,
-        mvps: &[[f32; 16]],
+        per_instance: &[[f32; 32]],
     ) -> RenderResult<()> {
         let extent = self.swapchain.extent;
         let framebuffer = self.frame.framebuffers[image_index as usize];
@@ -1812,20 +1850,20 @@ impl Backend {
             self.ctx.device.cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.mesh.mesh.vertex.raw), &[0]);
             self.ctx.device.cmd_bind_index_buffer(cmd, self.mesh.mesh.index.raw, 0, vk::IndexType::UINT16);
 
-            // Per-instance loop: push the instance's MVP, then draw the
-            // cube. The pipeline, vertex buffer, and index buffer are
-            // bound once outside the loop (Vulkan bind-once-draw-many).
-            for mvp in mvps {
-                let mvp_bytes: &[u8] = std::slice::from_raw_parts(
-                    mvp.as_ptr() as *const u8,
-                    std::mem::size_of::<[f32; 16]>(),
+            // Per-instance loop: push view_proj + model (128 bytes),
+            // then draw. The pipeline, vertex buffer, and index buffer
+            // are bound once outside the loop (Vulkan bind-once-draw-many).
+            for pc in per_instance {
+                let pc_bytes: &[u8] = std::slice::from_raw_parts(
+                    pc.as_ptr() as *const u8,
+                    std::mem::size_of::<[f32; 32]>(),
                 );
                 self.ctx.device.cmd_push_constants(
                     cmd,
                     self.pipeline.pipeline_layout,
                     vk::ShaderStageFlags::VERTEX,
                     0,
-                    mvp_bytes,
+                    pc_bytes,
                 );
                 self.ctx.device.cmd_draw_indexed(cmd, self.mesh.mesh.index_count, 1, 0, 0, 0);
             }

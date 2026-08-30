@@ -126,3 +126,26 @@ Stage Summary:
 - The game's main loop renders a 4-cube animated scene with perspective projection, depth-tested occlusion, and back-face culling.
 - Deliverables in /home/z/my-project/download/: mystical_arcana_cube.png (single cube), mystical_arcana_scene.png (4-cube scene).
 - Next steps (future work): textured meshes (need a sampler + descriptor set), lighting (need per-vertex normals + a light UBO), camera input (need arcane_input wired to mouse/keyboard), asset loading (need arcane_assets + a glTF or OBJ parser), ECS-driven scene graph (need arcane_ecs + arcane_world to actually be used).
+
+---
+Task ID: 4-lighting
+Agent: main (super-z)
+Task: Phase E — Add per-vertex normals + ambient/diffuse/rim directional lighting. Push to remote renderer-vulkan branch (configured GitHub origin with PAT).
+
+Work Log:
+- Found a prior session's partial Phase E work: GLSL source for lit.vert + lit.frag existed in crates/arcane_render/shaders/glsl/, but lit.frag.spv was not compiled and lib.rs was still using the tri.* pipeline. Completed the work:
+  * Compiled lit.frag -> lit.frag.spv via `glslc -fshader-stage=frag`.
+  * Updated Vertex struct in lib.rs: pos + color + normal (3x[3 f32] = 36 bytes, bytemuck::Pod-compatible since all 4-byte aligned). Added Vertex::new() constructor.
+  * Updated TriangleMesh: 3 verts in Z=0 plane, all with normal (0,0,1) facing the camera.
+  * Updated CubeMesh: 24 verts now carry per-face outward normals (n_right=+X, n_left=-X, n_bottom=+Y, n_top=-Y, n_front=+Z, n_back=-Z) so lit.frag can compute N . L per face.
+  * Updated Pipeline::new: loads lit.{vert,frag}.spv instead of tri.*; vertex_attrs grew to 3 entries (pos@0, color@12, normal@24).
+  * Push constant block grew from 64 -> 128 bytes: { view_proj: mat4, model: mat4 } so the vertex shader can transform world-space normals via mat3(model). For uniform-scale + rotation models (the case we care about) mat3(model) is also the correct normal matrix (inverse-transpose of a rotation == the rotation).
+  * Updated render_objects: precomputes a per-instance [f32; 32] buffer per draw = view_proj cols (16) + model cols (16). The recording loop casts each entry to a 128-byte slice and pushes as one cmd_push_constants call (simpler than splitting into two pushes; bandwidth cost is negligible at our scale).
+  * Updated record_draw signature: per_instance: &[[f32; 32]] instead of &[[f32; 16]]; the bind-once-draw-many pattern is unchanged.
+- Git remote setup: configured `origin` as https://Nexusdeveloper902:<PAT>@github.com/Nexusdeveloper902/Mystical-Arcana.git. Pushed local `main` to remote branch `renderer-vulkan` to avoid clobbering the unrelated-historied remote `main` (which has prior PHASE 1/2 + mana/runes/spells work — preserved untouched).
+- Cleanup commit: removed 1354 build/ + target/ artifacts that were accidentally committed via `git add -A`. Also discovered and untracked a 492 MB bare git repo (`mystical-arcana.git/`) that had been accidentally created inside the working tree by a failed `git init --bare` attempt. The .gitignore was extended to catch all of /target/, /build/, **/target/, **/build/, and mystical-arcana.git/.
+
+Stage Summary:
+- Lit pipeline renders 40 frames cleanly with no validation errors. PNG output grew from 14 KB (flat per-face colors) to 16 KB (lit with gradients) — indicates the lighting is actually creating visible color variance.
+- Vertex format now supports normals; cube mesh exports correct per-face normals; renderer passes both view_proj and model via 128-byte push constant so vertex shader transforms normals into world space and fragment shader applies ambient + Lambertian diffuse + rim term.
+- All committed on local main + pushed to remote renderer-vulkan branch (commit 88360f2 = chore cleanup; commit ? = Phase E completion). Future phases will continue pushing to renderer-vulkan.
