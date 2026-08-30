@@ -756,6 +756,145 @@ impl CubeMesh {
     }
 }
 
+/// UV sphere with `stacks` latitude bands + `slices` longitude bands.
+/// Vertex normals are the unit-position vectors (since the sphere is
+/// centered at the origin with radius 1, normal = normalize(pos)). UVs
+/// wrap the sphere once around so the procedural checker tiles cleanly.
+pub struct SphereMesh {
+    pub mesh: Mesh,
+}
+
+impl SphereMesh {
+    pub fn new(ctx: &VkContext, stacks: u32, slices: u32) -> RenderResult<Self> {
+        assert!(stacks >= 2 && slices >= 3);
+        let mut verts: Vec<Vertex> = Vec::with_capacity(((stacks + 1) * (slices + 1)) as usize);
+        let mut indices: Vec<u16> = Vec::with_capacity((stacks * slices * 6) as usize);
+        let color = [0.85, 0.85, 0.92]; // cool off-white so the lighting reads
+        // Stacks go from top (pi/2) to bottom (-pi/2). Slices go around Y (0..2pi).
+        for i in 0..=stacks {
+            let phi = std::f32::consts::PI * 0.5 - (i as f32 / stacks as f32) * std::f32::consts::PI;
+            let y = phi.sin();
+            let r = phi.cos(); // radius at this latitude
+            let v = i as f32 / stacks as f32;
+            for j in 0..=slices {
+                let theta = (j as f32 / slices as f32) * std::f32::consts::TAU;
+                let x = r * theta.cos();
+                let z = r * theta.sin();
+                let normal = [x, y, z];
+                let uv = [j as f32 / slices as f32, v];
+                verts.push(Vertex::with_uv([x, y, z], color, normal, uv));
+            }
+        }
+        // Two triangles per quad (per stack x slice).
+        for i in 0..stacks {
+            for j in 0..slices {
+                let a = (i * (slices + 1) + j) as u16;
+                let b = (i * (slices + 1) + j + 1) as u16;
+                let c = ((i + 1) * (slices + 1) + j + 1) as u16;
+                let d = ((i + 1) * (slices + 1) + j) as u16;
+                indices.extend_from_slice(&[a, b, d, b, c, d]);
+            }
+        }
+        let mesh = MeshBuilder::new(ctx)
+            .vertices(&verts)
+            .indices_u16(&indices)
+            .build()?;
+        Ok(Self { mesh })
+    }
+
+    pub fn destroy(&mut self, ctx: &VkContext) {
+        self.mesh.destroy(ctx);
+    }
+}
+
+/// Square-base pyramid: 4 triangular side faces + 1 square base.
+/// 16 vertices (4 per side face + 4 for the base) for distinct normals
+/// + UVs per face. 18 indices (6 per side + 6 for the base = 24? no,
+/// 4 sides * 3 + 2 base triangles * 3 = 12+6 = 18). Wound CCW from
+/// outside so BACK-face culling keeps only outward-facing triangles.
+pub struct PyramidMesh {
+    pub mesh: Mesh,
+}
+
+impl PyramidMesh {
+    pub fn new(ctx: &VkContext) -> RenderResult<Self> {
+        let s = 1.0f32;
+        let h = 1.5f32; // height above base
+        let color_side = [0.95, 0.55, 0.25]; // warm orange
+        let color_base = [0.35, 0.35, 0.40]; // dark grey
+        // Apex (shared by all 4 side faces, but each side face keeps its
+        // own copy so normals are distinct per face).
+        let apex = [0.0, h, 0.0];
+        let bl = [-s, 0.0, -s];
+        let br = [ s, 0.0, -s];
+        let tr = [ s, 0.0,  s];
+        let tl = [-s, 0.0,  s];
+
+        let mut verts: Vec<Vertex> = Vec::with_capacity(16);
+        // Side face normals — point outward + up. Approximate by taking
+        // the average of the two base edge directions cross the up axis.
+        let n_front = [0.0,  0.5,  1.0];
+        let n_right = [1.0,  0.5,  0.0];
+        let n_back  = [0.0,  0.5, -1.0];
+        let n_left  = [-1.0, 0.5,  0.0];
+        let n_base  = [0.0, -1.0, 0.0];
+
+        // +Z (front) face — apex + bl + tl (CCW from outside which is +Z).
+        verts.push(Vertex::with_uv(apex, color_side, n_front, [0.5, 1.0]));
+        verts.push(Vertex::with_uv(bl,  color_side, n_front, [0.0, 0.0]));
+        verts.push(Vertex::with_uv(tl,  color_side, n_front, [1.0, 0.0]));
+        verts.push(Vertex::with_uv(apex, color_side, n_front, [0.5, 1.0])); // pad
+        // +X (right) face — apex + br + tr.
+        verts.push(Vertex::with_uv(apex, color_side, n_right, [0.5, 1.0]));
+        verts.push(Vertex::with_uv(br,  color_side, n_right, [0.0, 0.0]));
+        verts.push(Vertex::with_uv(tr,  color_side, n_right, [1.0, 0.0]));
+        verts.push(Vertex::with_uv(apex, color_side, n_right, [0.5, 1.0])); // pad
+        // -Z (back) face — apex + br + tr (CCW from outside = -Z).
+        verts.push(Vertex::with_uv(apex, color_side, n_back, [0.5, 1.0]));
+        verts.push(Vertex::with_uv(br,  color_side, n_back, [0.0, 0.0]));
+        verts.push(Vertex::with_uv(bl,  color_side, n_back, [1.0, 0.0]));
+        verts.push(Vertex::with_uv(apex, color_side, n_back, [0.5, 1.0])); // pad
+        // -X (left) face — apex + tl + bl.
+        verts.push(Vertex::with_uv(apex, color_side, n_left, [0.5, 1.0]));
+        verts.push(Vertex::with_uv(tl,  color_side, n_left, [0.0, 0.0]));
+        verts.push(Vertex::with_uv(bl,  color_side, n_left, [1.0, 0.0]));
+        verts.push(Vertex::with_uv(apex, color_side, n_left, [0.5, 1.0])); // pad
+
+        // Base (looking up from below, CCW so culling keeps it visible
+        // from below).
+        let base_base = verts.len() as u16;
+        verts.push(Vertex::with_uv(bl, color_base, n_base, [0.0, 0.0]));
+        verts.push(Vertex::with_uv(br, color_base, n_base, [1.0, 0.0]));
+        verts.push(Vertex::with_uv(tr, color_base, n_base, [1.0, 1.0]));
+        verts.push(Vertex::with_uv(tl, color_base, n_base, [0.0, 1.0]));
+
+        let mut indices: Vec<u16> = Vec::with_capacity(18);
+        // 4 side triangles (3 verts each): apex, bl, tl etc — CCW.
+        // Side 0 (+Z): apex, bl, tl
+        indices.extend_from_slice(&[0, 1, 2]);
+        // Side 1 (+X): apex, br, tr — but br and tr indices depend on
+        // the order we pushed them above.
+        indices.extend_from_slice(&[4, 5, 6]);
+        // Side 2 (-Z): apex, tr, bl
+        indices.extend_from_slice(&[8, 9, 10]);
+        // Side 3 (-X): apex, tl, bl
+        indices.extend_from_slice(&[12, 13, 14]);
+        // Base: bl, tr, br (CCW from below)
+        indices.extend_from_slice(&[base_base, base_base + 2, base_base + 1]);
+        indices.extend_from_slice(&[base_base, base_base + 3, base_base + 2]);
+
+        let mesh = MeshBuilder::new(ctx)
+            .vertices(&verts)
+            .indices_u16(&indices)
+            .build()?;
+        Ok(Self { mesh })
+    }
+
+    pub fn destroy(&mut self, ctx: &VkContext) {
+        self.mesh.destroy(ctx);
+    }
+}
+
 /// A flat horizontal plane of the given world-size, centered at the origin,
 /// facing +Y (normal up). Useful as a ground plane under the scene.
 /// Vertex winding is CCW when viewed from above (+Y side) so BACK-face
@@ -802,6 +941,8 @@ impl PlaneMesh {
 pub enum MeshKind {
     Cube,
     Plane,
+    Sphere,
+    Pyramid,
 }
 
 /// One scene entry: which mesh + which model matrix to draw it with.
@@ -1983,6 +2124,8 @@ pub struct Backend {
     pub frame: Frame,
     pub mesh: CubeMesh,
     pub plane_mesh: Mesh,
+    pub sphere_mesh: Mesh,
+    pub pyramid_mesh: Mesh,
     pub texture: Texture,
     pub descriptor_pool: vk::DescriptorPool,
     pub descriptor_set: vk::DescriptorSet,
@@ -2083,6 +2226,8 @@ impl Backend {
         )?;
         let mesh = CubeMesh::new(&ctx)?;
         let plane_mesh = PlaneMesh::new(&ctx, 20.0, 20.0)?.mesh;
+        let sphere_mesh = SphereMesh::new(&ctx, 12, 16)?.mesh;
+        let pyramid_mesh = PyramidMesh::new(&ctx)?.mesh;
 
         let observatory = Observatory::start(observatory_addr);
 
@@ -2102,6 +2247,8 @@ impl Backend {
             frame,
             mesh,
             plane_mesh,
+            sphere_mesh,
+            pyramid_mesh,
             texture,
             descriptor_pool,
             descriptor_set,
@@ -2138,7 +2285,7 @@ impl Backend {
         frame_index: u64,
         scene: &[SceneInstance],
     ) -> RenderResult<()> {
-        use arcane_math::{Mat4, Vec3, mat4_to_cols_array, vulkan_perspective};
+        use arcane_math::{Mat4, Vec3, look_at, mat4_to_cols_array, vulkan_perspective};
 
         let aspect = self.width as f32 / self.height as f32;
         let proj: Mat4 = vulkan_perspective(
@@ -2147,7 +2294,19 @@ impl Backend {
             0.1,
             100.0,
         );
-        let view: Mat4 = Mat4::from_translation(Vec3::new(0.0, 0.0, -5.0));
+        // Orbit camera: eye position rotates around the Y axis at a
+        // rate of 0.01 rad/frame (~6 deg/sec at 1000 fps, ~0.6 deg/sec
+        // at 60 fps). Looking at the origin, up = +Y. The orbit radius
+        // is 8 units so the cubes at +/- 3 still fit in view.
+        let angle = (frame_index as f32) * 0.01;
+        let eye = Vec3::new(
+            angle.cos() * 8.0,
+            2.5,
+            angle.sin() * 8.0,
+        );
+        let target = Vec3::new(0.0, 0.0, 0.0);
+        let up = Vec3::new(0.0, 1.0, 0.0);
+        let view: Mat4 = look_at(eye, target, up);
         let view_proj: Mat4 = proj * view;
         let view_proj_cols = mat4_to_cols_array(view_proj);
 
@@ -2294,6 +2453,8 @@ impl Backend {
                 let mesh = match kind {
                     MeshKind::Cube => &self.mesh.mesh,
                     MeshKind::Plane => &self.plane_mesh,
+                    MeshKind::Sphere => &self.sphere_mesh,
+                    MeshKind::Pyramid => &self.pyramid_mesh,
                 };
                 self.ctx.device.cmd_bind_vertex_buffers(
                     cmd, 0, std::slice::from_ref(&mesh.vertex.raw), &[0],
@@ -2454,6 +2615,8 @@ impl Drop for Backend {
         self.readback.destroy(&self.ctx);
         self.mesh.destroy(&self.ctx);
         self.plane_mesh.destroy(&self.ctx);
+        self.sphere_mesh.destroy(&self.ctx);
+        self.pyramid_mesh.destroy(&self.ctx);
         self.texture.destroy(&self.ctx);
         unsafe { self.ctx.device.destroy_descriptor_pool(self.descriptor_pool, None); }
         self.pipeline.destroy(&self.ctx);

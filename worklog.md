@@ -171,3 +171,22 @@ Stage Summary:
 - Renderer now supports: per-vertex normals, ambient+diffuse+rim directional light, procedural checker pattern via UV, ground plane mesh, cube mesh, multi-mesh scenes via MeshKind enum, descriptor set + sampler + texture image plumbing.
 - 20-frame smoke test renders cleanly with no validation errors. PNG output grew from 16 KB (Phase E flat lighting) to 19 KB (Phase F with checker pattern) — extra variance from the checker.
 - Phase F committed as 'phase F (textured meshes): UV + procedural checker + ground plane + descriptor set' on local main, pushed to origin/renderer-vulkan.
+
+---
+Task ID: 6-orbit-camera-primitives
+Agent: main (super-z)
+Task: Phase G — Add sphere + pyramid primitives, orbit camera motion.
+
+Work Log:
+- Added SphereMesh: UV sphere with N stacks + M slices, vertex normals = unit positions, UVs wrap once around. Default 12x16 stacks/slices = 221 verts, 1152 indices.
+- Added PyramidMesh: 4 triangular side faces + 1 square base = 20 verts (16 sides + 4 base) + 18 indices (4 side tris + 2 base tris). Each side face has its own normal (outward + up) and UV; base faces down.
+- Extended MeshKind enum with Sphere + Pyramid variants. Backend now owns a sphere_mesh + pyramid_mesh alongside the existing cube_mesh + plane_mesh. record_draw matches MeshKind to the right mesh.
+- Drop sequence updated to destroy sphere_mesh + pyramid_mesh.
+- Orbit camera: render_scene now computes view = look_at(eye, target, up) where eye = (cos(t)*8, 2.5, sin(t)*8), target = (0,0,0), up = (0,1,0), t = frame_index * 0.01. This produces visible camera motion around the scene without requiring input hardware (the camera circles the origin at ~6 deg/sec at 1000 fps, ~0.6 deg/sec at 60 fps).
+- Updated main.rs scene: ground plane + 4 cubes + 1 sphere + 2 pyramids (8 instances total). Sphere is behind center cube; pyramids are placed left-behind and right-behind; all rotate around Y at varying rates.
+
+Stage Summary:
+- Renderer primitives: Cube (24v/36i), Plane (4v/6i), Sphere (221v/1152i), Pyramid (20v/18i). All lit + textured with the procedural checker.
+- Camera: orbit at radius 8 around Y axis, looking at origin, +Y up.
+- 20-frame smoke test renders cleanly with no validation errors. PNG output grew from 19 KB (Phase F single cube + plane) to 44 KB (Phase G multi-primitive + orbit view) — significant visual richness increase.
+- Phase G committed on local main, pushed to origin/renderer-vulkan.

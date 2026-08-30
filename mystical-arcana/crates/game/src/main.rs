@@ -100,18 +100,22 @@ fn main() -> anyhow::Result<()> {
     let mut validation_failed_count: u64 = 0;
     let mut render_error_count: u64 = 0;
 
-    // Build the scene: a ground plane + a row of three cubes plus one
-    // floating above. Each cube has a fixed world-space offset and
-    // rotates around Y at its own rate so the scene has visible motion
-    // between frames. The ground plane is a 20x20 unit plane drawn at
-    // y = -2 (just below the cubes) and tiled 8x with the checker.
+    // Build the scene: a ground plane + a row of three cubes plus a
+    // floating sphere + pyramid. Each object has a fixed world-space
+    // offset and rotates around Y at its own rate so the scene has
+    // visible motion between frames. The ground plane is a 20x20 unit
+    // plane drawn at y = -2 (just below the objects) and tiled 8x with
+    // the checker.
     //
-    // Cube layout (camera at (0,0,+5) looking down -Z):
-    //   [0] ground  20x20 at y=-2 (no rotation)
-    //   [1] center  (0, 0,  0) — slow spin
-    //   [2] left    (-3, 0, 0) — fast spin
-    //   [3] right   (+3, 0, 0) — reverse slow spin
-    //   [4] top      (0, 2, 0) — medium spin (above the center cube)
+    // Object layout (camera at eye rotating around Y, looking at origin):
+    //   [0] ground  20x20 at y=-2
+    //   [1] center cube  (0, 0, 0) — slow spin
+    //   [2] left cube   (-3, 0, 0) — fast spin
+    //   [3] right cube  (+3, 0, 0) — reverse spin
+    //   [4] top cube    (0, 2.5, 0) — medium spin, scaled 0.6
+    //   [5] sphere      (0, 0.5, -3) — counter-rotating around Y
+    //   [6] pyramid     (-3, 0.5, -3) — slow spin
+    //   [7] pyramid     (3, 0.5, -3) — reverse slow spin
     use arcane_math::{Mat4, Vec3};
 
     while !STOP.load(Ordering::SeqCst) {
@@ -119,30 +123,38 @@ fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // Per-frame model matrices. Each cube has a fixed translation
+        // Per-frame model matrices. Each object has a fixed translation
         // and a Y rotation that increments with frame_index (so the scene
         // animates without input). The plane model is just a translation
         // down by 2 units — no rotation.
         let t = frame_index as f32;
         let plane_model = Mat4::from_translation(Vec3::new(0.0, -2.0, 0.0));
-        let cube_models: [(MeshKind, Mat4); 4] = [
-            // [0] center: 0.05 rad/frame ~ 50 deg/sec at 1000 fps
+        let scene_arr: [(MeshKind, Mat4); 7] = [
+            // [1] center cube: 0.05 rad/frame
             (MeshKind::Cube, Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0))
                 * Mat4::from_rotation_y(t * 0.05)),
-            // [1] left: 0.08 rad/frame
+            // [2] left cube: 0.08 rad/frame
             (MeshKind::Cube, Mat4::from_translation(Vec3::new(-3.0, 0.0, 0.0))
                 * Mat4::from_rotation_y(t * 0.08)),
-            // [2] right: -0.04 rad/frame (reverse)
+            // [3] right cube: -0.04 rad/frame (reverse)
             (MeshKind::Cube, Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0))
                 * Mat4::from_rotation_y(-t * 0.04)),
-            // [3] top: 0.06 rad/frame, also smaller (scale 0.6) so it
-            // doesn't visually merge with the center cube.
+            // [4] top cube: 0.06 rad/frame, scaled 0.6
             (MeshKind::Cube, Mat4::from_translation(Vec3::new(0.0, 2.5, 0.0))
                 * Mat4::from_scale(Vec3::new(0.6, 0.6, 0.6))
                 * Mat4::from_rotation_y(t * 0.06)),
+            // [5] sphere: behind center, counter-rotating slowly
+            (MeshKind::Sphere, Mat4::from_translation(Vec3::new(0.0, 0.5, -3.0))
+                * Mat4::from_rotation_y(-t * 0.03)),
+            // [6] pyramid: left-behind, slow spin
+            (MeshKind::Pyramid, Mat4::from_translation(Vec3::new(-3.0, 0.5, -3.0))
+                * Mat4::from_rotation_y(t * 0.04)),
+            // [7] pyramid: right-behind, reverse spin
+            (MeshKind::Pyramid, Mat4::from_translation(Vec3::new(3.0, 0.5, -3.0))
+                * Mat4::from_rotation_y(-t * 0.05)),
         ];
         let scene: Vec<SceneInstance> = std::iter::once(SceneInstance::new(MeshKind::Plane, plane_model))
-            .chain(cube_models.iter().map(|(k, m)| SceneInstance::new(*k, *m)))
+            .chain(scene_arr.iter().map(|(k, m)| SceneInstance::new(*k, *m)))
             .collect();
 
         // Check for SIGINT once per frame; the cost is one SeqCst atomic
