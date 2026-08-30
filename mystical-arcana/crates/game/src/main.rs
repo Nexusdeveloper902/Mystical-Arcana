@@ -137,6 +137,7 @@ fn main() -> anyhow::Result<()> {
     //   [5] sphere      (0, 0.5, -3) — counter-rotating around Y
     //   [6] pyramid     (-3, 0.5, -3) — slow spin
     //   [7] pyramid     (3, 0.5, -3) — reverse slow spin
+    //   [8] octahedron (loaded OBJ asset)  (0, 0.5, 3) — fast spin
     use arcane_math::Vec3;
     let mut world = World::new();
     {
@@ -182,6 +183,14 @@ fn main() -> anyhow::Result<()> {
         world.attach(e, Transform::at(Vec3::new(3.0, 0.5, -3.0)));
         world.attach(e, MeshKindComponent(MeshKind::Pyramid));
         world.attach(e, Spin::new(-0.05));
+        // Octahedron (loaded OBJ asset, in front of the camera).
+        let e = world.spawn();
+        world.attach(
+            e,
+            Transform::at(Vec3::new(0.0, 0.5, 3.0)).with_scale(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        world.attach(e, MeshKindComponent(MeshKind::LoadedObj));
+        world.attach(e, Spin::new(0.07));
     }
     log::info!("ECS scene: {} entities, {} spinning", world.count(), world.entities_with::<Spin>().len());
 

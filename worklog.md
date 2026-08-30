@@ -237,3 +237,35 @@ Stage Summary:
 - Hot-reload path is fully wired: load_shader_from_disk, ShaderWatcher (polling), Pipeline::reload_shaders_from_disk, Backend::hotreload_if_changed, main.rs env-var gating.
 - 15-frame smoke test with hot-reload enabled: no validation errors, no crashes. The watcher correctly identifies when .spv files are unchanged (returns false, no reload attempt).
 - Phase I committed on local main, pushed to origin/renderer-vulkan.
+
+---
+Task ID: 9-asset-loading-obj
+Agent: main (super-z)
+Task: Phase J — Simple OBJ parser, load sphere/octahedron as embedded assets.
+
+Work Log:
+- Rewrote arcane_assets with a real Wavefront OBJ parser:
+  * Parses `v x y z` (vertex position), `vn x y z` (vertex normal), `f v1/vt1/vn1 v2/vt2/vn2 ...` (face).
+  * Triangulates polygons (n>3) via fan (vertex 0 + consecutive pairs).
+  * Supports negative indices (relative to end).
+  * Synthesizes face normals from cross product when `vn` is absent.
+  * Uses provided normals when `vn` is present.
+  * Skips unsupported directives (vt, g, o, mtllib, usemtl, s) so real-world OBJ files mostly parse.
+  * Returns ObjModel { positions, normals, indices }.
+- Added 7 unit tests covering: octahedron parse, skip unsupported directives, quad-to-tris fan triangulation, synthesized face normal direction, provided-normals path, negative index resolution, line-number reporting on error. All pass.
+- Embedded a small test asset: `OCTAHEDRON_OBJ` (6 verts, 8 tris, all faces exposed). Small enough to embed inline; real-world .obj files would load from disk via a future Phase.
+- Added MeshKind::LoadedObj variant in arcane_render. Backend holds an `obj_mesh: Mesh` constructed at Backend::with_observatory time by:
+  1. Parsing the embedded OCTAHEDRON_OBJ via arcane_assets::parse_obj.
+  2. Building a Vec<Vertex> with positions, synthesized face normals, gold color, zero UVs.
+  3. Using MeshBuilder to upload positions + indices to GPU buffers.
+- record_draw matches MeshKind::LoadedObj to self.obj_mesh.
+- Backend::Drop destroys obj_mesh alongside the other primitives.
+- arcane_render Cargo.toml gains arcane_assets dep (workspace already had it listed).
+- main.rs scene gains an octahedron entity: Transform at (0, 0.5, 3) scaled 0.8, MeshKindComponent::LoadedObj, Spin rate 0.07. The octahedron is in front of the camera (which orbits at radius 8), so the user can clearly see the loaded asset.
+
+Stage Summary:
+- arcane_assets now has a real OBJ parser + 7 unit tests + an embedded octahedron test asset.
+- arcane_render supports MeshKind::LoadedObj via the obj_mesh field; parses + uploads the OBJ at Backend init time.
+- main.rs scene has 9 entities (1 plane + 4 cubes + 1 sphere + 2 pyramids + 1 octahedron), 8 spinning.
+- 20-frame smoke test: "loaded OBJ asset: octahedron, 24 verts, 8 tris", "ECS scene: 9 entities, 8 spinning", renders cleanly. PNG output is 40 KB (richer than Phase F's 19 KB, comparable to Phase G's 44 KB — slight variance from the new octahedron).
+- Phase J committed on local main, pushed to origin/renderer-vulkan.

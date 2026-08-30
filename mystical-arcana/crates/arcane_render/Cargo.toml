@@ -16,6 +16,7 @@ image.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true
 arcane_math = { path = "../arcane_math" }
+arcane_assets = { path = "../arcane_assets" }
 
 [build-dependencies]
 # nothing yet

@@ -943,6 +943,10 @@ pub enum MeshKind {
     Plane,
     Sphere,
     Pyramid,
+    /// The OBJ-loaded mesh (octahedron by default). Lets the renderer
+    /// exercise the arcane_assets OBJ parser without needing a real disk
+    /// asset pipeline.
+    LoadedObj,
 }
 
 /// One scene entry: which mesh + which model matrix to draw it with.
@@ -2394,6 +2398,7 @@ pub struct Backend {
     pub plane_mesh: Mesh,
     pub sphere_mesh: Mesh,
     pub pyramid_mesh: Mesh,
+    pub obj_mesh: Mesh,
     pub texture: Texture,
     pub descriptor_pool: vk::DescriptorPool,
     pub descriptor_set: vk::DescriptorSet,
@@ -2496,6 +2501,28 @@ impl Backend {
         let plane_mesh = PlaneMesh::new(&ctx, 20.0, 20.0)?.mesh;
         let sphere_mesh = SphereMesh::new(&ctx, 12, 16)?.mesh;
         let pyramid_mesh = PyramidMesh::new(&ctx)?.mesh;
+        // OBJ-loaded asset: parse the embedded OCTAHEDRON_OBJ at runtime
+        // via arcane_assets::parse_obj, then build a renderer Mesh from
+        // the parsed positions + synthesized face normals + zero UVs.
+        // Phase J demonstrates the asset-loading path without a disk
+        // pipeline; a future host can swap in a real .obj file.
+        let obj_model = arcane_assets::parse_obj(arcane_assets::OCTAHEDRON_OBJ)
+            .map_err(|e| RenderError::Other(format!("parse octahedron OBJ: {}", e)))?;
+        log::info!(
+            "loaded OBJ asset: octahedron, {} verts, {} tris",
+            obj_model.vertex_count(),
+            obj_model.triangle_count()
+        );
+        let mut obj_verts: Vec<Vertex> = Vec::with_capacity(obj_model.positions.len());
+        for (p, n) in obj_model.positions.iter().zip(obj_model.normals.iter()) {
+            // Octahedron color — warm gold to visually distinguish it
+            // from the cube (yellow on +X) and the sphere (cool grey).
+            obj_verts.push(Vertex::with_uv(*p, [0.95, 0.80, 0.20], *n, [0.0, 0.0]));
+        }
+        let obj_mesh = MeshBuilder::new(&ctx)
+            .vertices(&obj_verts)
+            .indices_u16(&obj_model.indices)
+            .build()?;
 
         let observatory = Observatory::start(observatory_addr);
 
@@ -2517,6 +2544,7 @@ impl Backend {
             plane_mesh,
             sphere_mesh,
             pyramid_mesh,
+            obj_mesh,
             texture,
             descriptor_pool,
             descriptor_set,
@@ -2764,6 +2792,7 @@ impl Backend {
                     MeshKind::Plane => &self.plane_mesh,
                     MeshKind::Sphere => &self.sphere_mesh,
                     MeshKind::Pyramid => &self.pyramid_mesh,
+                    MeshKind::LoadedObj => &self.obj_mesh,
                 };
                 self.ctx.device.cmd_bind_vertex_buffers(
                     cmd, 0, std::slice::from_ref(&mesh.vertex.raw), &[0],
@@ -2926,6 +2955,7 @@ impl Drop for Backend {
         self.plane_mesh.destroy(&self.ctx);
         self.sphere_mesh.destroy(&self.ctx);
         self.pyramid_mesh.destroy(&self.ctx);
+        self.obj_mesh.destroy(&self.ctx);
         self.texture.destroy(&self.ctx);
         unsafe { self.ctx.device.destroy_descriptor_pool(self.descriptor_pool, None); }
         self.pipeline.destroy(&self.ctx);

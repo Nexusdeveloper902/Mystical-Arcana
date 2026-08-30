@@ -151,6 +151,7 @@ name = "arcane_render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arcane_assets",
  "arcane_math",
  "ash",
  "bytemuck",
