@@ -1672,18 +1672,29 @@ impl Backend {
     }
 
     pub fn render_one(&mut self, frame_index: u64) -> RenderResult<()> {
-        // Compute the model-view-projection matrix for this frame.
-        //
-        // The MVP is proj * view * model, where:
-        //   proj  = Vulkan perspective (depth range [0, 1], Y down on screen)
-        //   view  = translate the world by (0, 0, -5) so the cube (extents
-        //           +/- 1 on each axis) sits 5 units in front of the camera
-        //   model = rotate around Y by frame_index * 0.05 rad/frame
-        //           (about 50 degrees per second at 1000 fps; slower at
-        //           the typical 60 fps demo rate)
-        //
-        // The result is uploaded as a 64-byte push constant that the
-        // vertex shader reads as `mat4 u_mvp` (column-major, no transpose).
+        // Default single-cube scene for backwards compatibility: a single
+        // cube at the origin rotating around Y. Real scenes should call
+        // `render_objects` with a list of model matrices instead.
+        use arcane_math::Mat4;
+        let angle = (frame_index as f32) * 0.05;
+        let model = Mat4::from_rotation_y(angle);
+        self.render_objects(frame_index, std::slice::from_ref(&model))
+    }
+
+    /// Render a scene containing many cube instances, each transformed by
+    /// its own model matrix. All instances share the same vertex/index
+    /// buffers and the same graphics pipeline; the per-instance MVP is
+    /// pushed as a 64-byte push constant before each draw.
+    ///
+    /// The view and projection matrices are computed internally from the
+    /// framebuffer dimensions (so the aspect ratio is always right). The
+    /// camera sits at (0, 0, +5) in world space looking at the origin
+    /// with a 60 degree vertical FOV.
+    pub fn render_objects(
+        &mut self,
+        frame_index: u64,
+        models: &[arcane_math::Mat4],
+    ) -> RenderResult<()> {
         use arcane_math::{Mat4, Vec3, mat4_to_cols_array, vulkan_perspective};
 
         let aspect = self.width as f32 / self.height as f32;
@@ -1694,10 +1705,13 @@ impl Backend {
             100.0,
         );
         let view: Mat4 = Mat4::from_translation(Vec3::new(0.0, 0.0, -5.0));
-        let angle = (frame_index as f32) * 0.05;
-        let model: Mat4 = Mat4::from_rotation_y(angle);
-        let mvp: Mat4 = proj * view * model;
-        let mvp: [f32; 16] = mat4_to_cols_array(mvp);
+        let view_proj: Mat4 = proj * view;
+        // Precompute each instance's MVP as a [f32; 16] so the recording
+        // loop doesn't allocate or recompute per draw call.
+        let mvps: Vec<[f32; 16]> = models
+            .iter()
+            .map(|m| mat4_to_cols_array(view_proj * *m))
+            .collect();
 
         let current = self.frame.current;
         let in_flight = self.frame.in_flight[current];
@@ -1719,7 +1733,7 @@ impl Backend {
                 .map_err(|e| RenderError::Other(format!("reset_command_buffer: {:?}", e)))?;
         }
 
-        self.record_draw(cmd, image_index, &mvp)?;
+        self.record_draw(cmd, image_index, &mvps)?;
 
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let wait_semaphores = [image_available];
@@ -1755,7 +1769,7 @@ impl Backend {
         &self,
         cmd: vk::CommandBuffer,
         image_index: u32,
-        mvp: &[f32; 16],
+        mvps: &[[f32; 16]],
     ) -> RenderResult<()> {
         let extent = self.swapchain.extent;
         let framebuffer = self.frame.framebuffers[image_index as usize];
@@ -1797,18 +1811,24 @@ impl Backend {
             self.ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline.pipeline);
             self.ctx.device.cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.mesh.mesh.vertex.raw), &[0]);
             self.ctx.device.cmd_bind_index_buffer(cmd, self.mesh.mesh.index.raw, 0, vk::IndexType::UINT16);
-            let mvp_bytes: &[u8] = std::slice::from_raw_parts(
-                mvp.as_ptr() as *const u8,
-                std::mem::size_of::<[f32; 16]>(),
-            );
-            self.ctx.device.cmd_push_constants(
-                cmd,
-                self.pipeline.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                mvp_bytes,
-            );
-            self.ctx.device.cmd_draw_indexed(cmd, self.mesh.mesh.index_count, 1, 0, 0, 0);
+
+            // Per-instance loop: push the instance's MVP, then draw the
+            // cube. The pipeline, vertex buffer, and index buffer are
+            // bound once outside the loop (Vulkan bind-once-draw-many).
+            for mvp in mvps {
+                let mvp_bytes: &[u8] = std::slice::from_raw_parts(
+                    mvp.as_ptr() as *const u8,
+                    std::mem::size_of::<[f32; 16]>(),
+                );
+                self.ctx.device.cmd_push_constants(
+                    cmd,
+                    self.pipeline.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    mvp_bytes,
+                );
+                self.ctx.device.cmd_draw_indexed(cmd, self.mesh.mesh.index_count, 1, 0, 0, 0);
+            }
             self.ctx.device.cmd_end_render_pass(cmd);
             self.ctx.device.end_command_buffer(cmd)
                 .map_err(|e| RenderError::Other(format!("end_command_buffer: {:?}", e)))?;

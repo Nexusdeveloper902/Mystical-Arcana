@@ -100,23 +100,55 @@ fn main() -> anyhow::Result<()> {
     let mut validation_failed_count: u64 = 0;
     let mut render_error_count: u64 = 0;
 
+    // Build the scene: a row of three cubes plus one floating above.
+    // Each cube has a fixed world-space offset and rotates around Y at
+    // its own rate so the scene has visible motion between frames.
+    //
+    // Cube layout (camera at (0,0,+5) looking down -Z):
+    //   [0] center  (0, 0,  0) — slow spin
+    //   [1] left    (-3, 0, 0) — fast spin
+    //   [2] right   (+3, 0, 0) — reverse slow spin
+    //   [3] top      (0, 2, 0) — medium spin (above the center cube)
+    use arcane_math::{Mat4, Vec3};
+
     while !STOP.load(Ordering::SeqCst) {
         if !forever && frame_index >= frame_cap {
             break;
         }
 
+        // Per-frame model matrices. Each cube has a fixed translation
+        // and a Y rotation that increments with frame_index (so the scene
+        // animates without input).
+        let t = frame_index as f32;
+        let models: [Mat4; 4] = [
+            // [0] center: 0.05 rad/frame ~ 50 deg/sec at 1000 fps
+            Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0))
+                * Mat4::from_rotation_y(t * 0.05),
+            // [1] left: 0.08 rad/frame
+            Mat4::from_translation(Vec3::new(-3.0, 0.0, 0.0))
+                * Mat4::from_rotation_y(t * 0.08),
+            // [2] right: -0.04 rad/frame (reverse)
+            Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0))
+                * Mat4::from_rotation_y(-t * 0.04),
+            // [3] top: 0.06 rad/frame, also smaller (scale 0.6) so it
+            // doesn't visually merge with the center cube.
+            Mat4::from_translation(Vec3::new(0.0, 2.5, 0.0))
+                * Mat4::from_scale(Vec3::new(0.6, 0.6, 0.6))
+                * Mat4::from_rotation_y(t * 0.06),
+        ];
+
         // Check for SIGINT once per frame; the cost is one SeqCst atomic
         // load (~1 ns) which is negligible next to a Vulkan frame.
-        // We can't check inside render_one (the GPU work isn't interruptible
+        // We can't check inside render_objects (the GPU work isn't interruptible
         // from the CPU side) but the per-frame cadence is fast enough that
         // Ctrl-C responds within one frame on lavapipe (~1 ms at 1000 fps).
         // On a real GPU at 60 fps this still means ~16 ms response time.
 
-        match backend.render_one(frame_index) {
+        match backend.render_objects(frame_index, &models) {
             Ok(()) => {}
             Err(e) => {
                 render_error_count += 1;
-                log::error!("render_one failed at frame {frame_index}: {e:?}");
+                log::error!("render_objects failed at frame {frame_index}: {e:?}");
                 if render_error_count > 3 {
                     log::error!("too many render errors; aborting loop");
                     std::process::exit(3);
