@@ -491,11 +491,15 @@ pub struct Vertex {
     pub pos: [f32; 3],
     pub color: [f32; 3],
     pub normal: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 impl Vertex {
     pub fn new(pos: [f32; 3], color: [f32; 3], normal: [f32; 3]) -> Self {
-        Self { pos, color, normal }
+        Self { pos, color, normal, uv: [0.0, 0.0] }
+    }
+    pub fn with_uv(pos: [f32; 3], color: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Self {
+        Self { pos, color, normal, uv }
     }
 }
 
@@ -508,10 +512,11 @@ pub struct TriangleMesh {
 impl TriangleMesh {
     pub fn new(ctx: &VkContext) -> RenderResult<Self> {
         // Flat triangle in the Z=0 plane, CCW winding, facing +Z.
+        // UVs map the triangle to a sub-rectangle of the texture.
         let vertices: [Vertex; 3] = [
-            Vertex::new([ 0.5, -0.5, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
-            Vertex::new([-0.5, -0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
-            Vertex::new([ 0.0,  0.5, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]),
+            Vertex::with_uv([ 0.5, -0.5, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0]),
+            Vertex::with_uv([-0.5, -0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]),
+            Vertex::with_uv([ 0.0,  0.5, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.5, 1.0]),
         ];
         let indices: [u16; 3] = [0, 1, 2];
         MeshBuilder::new(ctx)
@@ -690,36 +695,44 @@ impl CubeMesh {
         // (BL, BR, TR) and (BL, TR, TL).
         let mut verts: Vec<Vertex> = Vec::with_capacity(24);
 
+        // Per-face UV pattern (BL, BR, TR, TL): each face maps the
+        // whole texture onto itself so the checker is visible on every
+        // face at the same scale.
+        let uv_bl = [0.0, 0.0];
+        let uv_br = [1.0, 0.0];
+        let uv_tr = [1.0, 1.0];
+        let uv_tl = [0.0, 1.0];
+
         // +X face (right)
-        verts.push(Vertex::new([ s, -s, -s], c_right,  n_right ));
-        verts.push(Vertex::new([ s, -s,  s], c_right,  n_right ));
-        verts.push(Vertex::new([ s,  s,  s], c_right,  n_right ));
-        verts.push(Vertex::new([ s,  s, -s], c_right,  n_right ));
+        verts.push(Vertex::with_uv([ s, -s, -s], c_right,  n_right,  uv_bl));
+        verts.push(Vertex::with_uv([ s, -s,  s], c_right,  n_right,  uv_br));
+        verts.push(Vertex::with_uv([ s,  s,  s], c_right,  n_right,  uv_tr));
+        verts.push(Vertex::with_uv([ s,  s, -s], c_right,  n_right,  uv_tl));
         // -X face (left)
-        verts.push(Vertex::new([-s, -s,  s], c_left,   n_left  ));
-        verts.push(Vertex::new([-s, -s, -s], c_left,   n_left  ));
-        verts.push(Vertex::new([-s,  s, -s], c_left,   n_left  ));
-        verts.push(Vertex::new([-s,  s,  s], c_left,   n_left  ));
+        verts.push(Vertex::with_uv([-s, -s,  s], c_left,   n_left,   uv_bl));
+        verts.push(Vertex::with_uv([-s, -s, -s], c_left,   n_left,   uv_br));
+        verts.push(Vertex::with_uv([-s,  s, -s], c_left,   n_left,   uv_tr));
+        verts.push(Vertex::with_uv([-s,  s,  s], c_left,   n_left,   uv_tl));
         // +Y face (bottom in Vulkan NDC)
-        verts.push(Vertex::new([-s,  s,  s], c_bottom, n_bottom));
-        verts.push(Vertex::new([-s,  s, -s], c_bottom, n_bottom));
-        verts.push(Vertex::new([ s,  s, -s], c_bottom, n_bottom));
-        verts.push(Vertex::new([ s,  s,  s], c_bottom, n_bottom));
+        verts.push(Vertex::with_uv([-s,  s,  s], c_bottom, n_bottom, uv_bl));
+        verts.push(Vertex::with_uv([-s,  s, -s], c_bottom, n_bottom, uv_br));
+        verts.push(Vertex::with_uv([ s,  s, -s], c_bottom, n_bottom, uv_tr));
+        verts.push(Vertex::with_uv([ s,  s,  s], c_bottom, n_bottom, uv_tl));
         // -Y face (top in Vulkan NDC)
-        verts.push(Vertex::new([-s, -s, -s], c_top,    n_top   ));
-        verts.push(Vertex::new([-s, -s,  s], c_top,    n_top   ));
-        verts.push(Vertex::new([ s, -s,  s], c_top,    n_top   ));
-        verts.push(Vertex::new([ s, -s, -s], c_top,    n_top   ));
+        verts.push(Vertex::with_uv([-s, -s, -s], c_top,    n_top,    uv_bl));
+        verts.push(Vertex::with_uv([-s, -s,  s], c_top,    n_top,    uv_br));
+        verts.push(Vertex::with_uv([ s, -s,  s], c_top,    n_top,    uv_tr));
+        verts.push(Vertex::with_uv([ s, -s, -s], c_top,    n_top,    uv_tl));
         // +Z face (front)
-        verts.push(Vertex::new([ s, -s,  s], c_front,  n_front ));
-        verts.push(Vertex::new([-s, -s,  s], c_front,  n_front ));
-        verts.push(Vertex::new([-s,  s,  s], c_front,  n_front ));
-        verts.push(Vertex::new([ s,  s,  s], c_front,  n_front ));
+        verts.push(Vertex::with_uv([ s, -s,  s], c_front,  n_front,  uv_bl));
+        verts.push(Vertex::with_uv([-s, -s,  s], c_front,  n_front,  uv_br));
+        verts.push(Vertex::with_uv([-s,  s,  s], c_front,  n_front,  uv_tr));
+        verts.push(Vertex::with_uv([ s,  s,  s], c_front,  n_front,  uv_tl));
         // -Z face (back)
-        verts.push(Vertex::new([-s, -s, -s], c_back,   n_back  ));
-        verts.push(Vertex::new([ s, -s, -s], c_back,   n_back  ));
-        verts.push(Vertex::new([ s,  s, -s], c_back,   n_back  ));
-        verts.push(Vertex::new([-s,  s, -s], c_back,   n_back  ));
+        verts.push(Vertex::with_uv([-s, -s, -s], c_back,   n_back,   uv_bl));
+        verts.push(Vertex::with_uv([ s, -s, -s], c_back,   n_back,   uv_br));
+        verts.push(Vertex::with_uv([ s,  s, -s], c_back,   n_back,   uv_tr));
+        verts.push(Vertex::with_uv([-s,  s, -s], c_back,   n_back,   uv_tl));
 
         // Per-face index pattern: 0,1,2,0,2,3 (relative to face base).
         let face_idx = [0u16, 1, 2, 0, 2, 3];
@@ -740,6 +753,304 @@ impl CubeMesh {
 
     pub fn destroy(&mut self, ctx: &VkContext) {
         self.mesh.destroy(ctx);
+    }
+}
+
+/// A flat horizontal plane of the given world-size, centered at the origin,
+/// facing +Y (normal up). Useful as a ground plane under the scene.
+/// Vertex winding is CCW when viewed from above (+Y side) so BACK-face
+/// culling keeps it visible from above and discards it from below.
+pub struct PlaneMesh {
+    pub mesh: Mesh,
+}
+
+impl PlaneMesh {
+    pub fn new(ctx: &VkContext, size_x: f32, size_z: f32) -> RenderResult<Self> {
+        let hx = size_x * 0.5;
+        let hz = size_z * 0.5;
+        // 4 verts in BL, BR, TR, TL order (CCW from +Y looking down).
+        // UVs repeat the texture 8x across the plane so the checker pattern
+        // is small enough to read as a ground texture rather than one tile.
+        let color = [0.7, 0.7, 0.7]; // neutral grey — modulated by texel
+        let normal = [0.0, 1.0, 0.0]; // up
+        let tile = 8.0;
+        let verts: [Vertex; 4] = [
+            Vertex::with_uv([-hx, 0.0,  hz], color, normal, [0.0,    0.0]),
+            Vertex::with_uv([ hx, 0.0,  hz], color, normal, [tile,   0.0]),
+            Vertex::with_uv([ hx, 0.0, -hz], color, normal, [tile,   tile]),
+            Vertex::with_uv([-hx, 0.0, -hz], color, normal, [0.0,    tile]),
+        ];
+        let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let mesh = MeshBuilder::new(ctx)
+            .vertices(&verts)
+            .indices_u16(&indices)
+            .build()?;
+        Ok(Self { mesh })
+    }
+
+    pub fn destroy(&mut self, ctx: &VkContext) {
+        self.mesh.destroy(ctx);
+    }
+}
+
+/// Which built-in mesh to draw for a scene instance. The Backend owns
+/// one of each primitive; the scene descriptor references them by kind so
+/// the caller never needs to borrow mesh data out of the Backend (which
+/// would conflict with the `&mut self` borrow that render_scene needs
+/// for the frame-state mutation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshKind {
+    Cube,
+    Plane,
+}
+
+/// One scene entry: which mesh + which model matrix to draw it with.
+#[derive(Clone, Copy)]
+pub struct SceneInstance {
+    pub mesh: MeshKind,
+    pub model: arcane_math::Mat4,
+}
+
+impl SceneInstance {
+    pub fn new(mesh: MeshKind, model: arcane_math::Mat4) -> Self {
+        Self { mesh, model }
+    }
+}
+
+// =============================================================================
+// Texture (procedural checker for now; will be loadable from disk later)
+// =============================================================================
+
+/// A 2D texture image + image view + sampler, all owned by the renderer.
+///
+/// For now this is constructed from a procedural checkerboard pattern
+/// generated in Rust. A future phase will let the caller supply image
+/// bytes loaded from disk via arcane_assets.
+pub struct Texture {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub sampler: vk::Sampler,
+    pub format: vk::Format,
+    pub extent: vk::Extent2D,
+}
+
+impl Texture {
+    /// Build a 64x64 RGBA checkerboard texture. The checker alternates
+    /// between two warm colors so it's visible against the cool background
+    /// clear. The texture is uploaded via a staging buffer + queue submit
+    /// + layout transitions (the standard Vulkan upload path).
+    pub fn new_checker(ctx: &VkContext) -> RenderResult<Self> {
+        let extent = vk::Extent2D { width: 64, height: 64 };
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let bytes_per_pixel = 4;
+        let total_bytes = extent.width as usize * extent.height as usize * bytes_per_pixel;
+
+        // Generate the checker pattern: 8x8 squares of 8x8 px each.
+        let mut pixels: Vec<u8> = Vec::with_capacity(total_bytes);
+        let color_a: [u8; 4] = [220, 200, 160, 255]; // warm light tan
+        let color_b: [u8; 4] = [120, 80, 60, 255];   // warm dark brown
+        let square = 8usize;
+        for y in 0..extent.height as usize {
+            for x in 0..extent.width as usize {
+                let cell_x = x / square;
+                let cell_y = y / square;
+                let c = if (cell_x + cell_y) % 2 == 0 { color_a } else { color_b };
+                pixels.extend_from_slice(&c);
+            }
+        }
+
+        // Staging buffer (HOST_VISIBLE) -> texture image (DEVICE_LOCAL).
+        let staging_size = total_bytes as vk::DeviceSize;
+        let mut staging = Buffer::new(
+            ctx,
+            staging_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        staging.write_bytes(&pixels)?;
+
+        // Image creation. initial_layout = UNDEFINED so the first barrier
+        // transitions it into TRANSFER_DST_OPTIMAL for the copy.
+        let image_create = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .format(format)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let image = unsafe {
+            ctx.device.create_image(&image_create, None)
+                .map_err(|e| RenderError::Allocator(format!("create_image (texture): {:?}", e)))?
+        };
+        let req = unsafe { ctx.device.get_image_memory_requirements(image) };
+        let mem_type = ctx.find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mem_type);
+        let memory = unsafe {
+            ctx.device.allocate_memory(&alloc, None)
+                .map_err(|e| RenderError::Allocator(format!("allocate_memory (texture): {:?}", e)))?
+        };
+        unsafe {
+            ctx.device.bind_image_memory(image, memory, 0)
+                .map_err(|e| RenderError::Allocator(format!("bind_image_memory (texture): {:?}", e)))?;
+        }
+
+        // One-shot upload command buffer: UNDEFINED -> TRANSFER_DST_OPTIMAL,
+        // copy buffer-to-image, then TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL.
+        let pool_create = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::empty())
+            .queue_family_index(ctx.graphics_queue_family);
+        let upload_pool = unsafe {
+            ctx.device.create_command_pool(&pool_create, None)
+                .map_err(|e| RenderError::Other(format!("create_command_pool (texture): {:?}", e)))?
+        };
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(upload_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe {
+            ctx.device.allocate_command_buffers(&alloc)
+                .map_err(|e| RenderError::Other(format!("alloc cmd (texture): {:?}", e)))?[0]
+        };
+        unsafe {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            ctx.device.begin_command_buffer(cmd, &begin)
+                .map_err(|e| RenderError::Other(format!("begin cmd (texture): {:?}", e)))?;
+
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0, level_count: 1,
+                    base_array_layer: 0, layer_count: 1,
+                });
+            ctx.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[], &[], std::slice::from_ref(&to_dst),
+            );
+
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 });
+            ctx.device.cmd_copy_buffer_to_image(
+                cmd,
+                staging.raw,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+
+            let to_read = vk::ImageMemoryBarrier::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0, level_count: 1,
+                    base_array_layer: 0, layer_count: 1,
+                });
+            ctx.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[], &[], std::slice::from_ref(&to_read),
+            );
+
+            ctx.device.end_command_buffer(cmd)
+                .map_err(|e| RenderError::Other(format!("end cmd (texture): {:?}", e)))?;
+        }
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&cmd));
+        unsafe {
+            ctx.device.queue_submit(ctx.graphics_queue, std::slice::from_ref(&submit_info), vk::Fence::null())
+                .map_err(|e| RenderError::Submit(format!("texture upload submit: {:?}", e)))?;
+            ctx.device.queue_wait_idle(ctx.graphics_queue)
+                .map_err(|e| RenderError::Other(format!("texture upload wait: {:?}", e)))?;
+            ctx.device.free_command_buffers(upload_pool, std::slice::from_ref(&cmd));
+            ctx.device.destroy_command_pool(upload_pool, None);
+        }
+
+        // Drop the staging buffer now (frees its memory).
+        staging.destroy(ctx);
+
+        // Image view + sampler.
+        let view_create = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0, level_count: 1,
+                base_array_layer: 0, layer_count: 1,
+            });
+        let view = unsafe {
+            ctx.device.create_image_view(&view_create, None)
+                .map_err(|e| RenderError::Allocator(format!("create_image_view (texture): {:?}", e)))?
+        };
+
+        let sampler_create = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .mip_lod_bias(0.0)
+            .anisotropy_enable(false)
+            .compare_op(vk::CompareOp::NEVER)
+            .min_lod(0.0)
+            .max_lod(0.0)
+            .border_color(vk::BorderColor::INT_OPAQUE_BLACK);
+        let sampler = unsafe {
+            ctx.device.create_sampler(&sampler_create, None)
+                .map_err(|e| RenderError::Allocator(format!("create_sampler: {:?}", e)))?
+        };
+
+        log::info!(
+            "texture: checkerboard {}x{} {:?} (uploaded via staging buffer)",
+            extent.width, extent.height, format
+        );
+
+        Ok(Self { image, memory, view, sampler, format, extent })
+    }
+
+    pub fn destroy(&mut self, ctx: &VkContext) {
+        unsafe {
+            ctx.device.destroy_sampler(self.sampler, None);
+            ctx.device.destroy_image_view(self.view, None);
+            ctx.device.destroy_image(self.image, None);
+            ctx.device.free_memory(self.memory, None);
+        }
     }
 }
 
@@ -897,12 +1208,19 @@ pub struct Pipeline {
     pub render_pass: vk::RenderPass,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub vert_module: vk::ShaderModule,
     pub frag_module: vk::ShaderModule,
 }
 
 impl Pipeline {
-    pub fn new(ctx: &VkContext, color_format: vk::Format, depth_format: vk::Format, extent: vk::Extent2D) -> RenderResult<Self> {
+    pub fn new(
+        ctx: &VkContext,
+        color_format: vk::Format,
+        depth_format: vk::Format,
+        extent: vk::Extent2D,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+    ) -> RenderResult<Self> {
         // Render pass: color attachment + depth attachment.
         // The depth attachment is cleared at the start of each render pass
         // and discarded at the end (we don't need to read it back; lavapipe
@@ -958,12 +1276,13 @@ impl Pipeline {
                 .map_err(|e| RenderError::Pipeline(format!("create_render_pass: {:?}", e)))?
         };
 
-        // Shaders — Phase E switched to the lit.{vert,frag} pair which
-        // carry per-vertex normals and apply ambient + diffuse + rim
-        // lighting in the fragment shader. The push-constant block grew
-        // from 64 bytes (MVP only) to 128 bytes (view_proj + model).
-        let vert_module = load_shader(ctx, "lit.vert.spv")?;
-        let frag_module = load_shader(ctx, "lit.frag.spv")?;
+        // Shaders — Phase F switched to the lit_textured.{vert,frag} pair
+        // which extends the lit pair with a UV attribute and a bound
+        // combined image sampler at set 0 binding 0. The fragment shader
+        // multiplies the per-vertex color by the sampled texel before
+        // applying ambient + diffuse + rim lighting.
+        let vert_module = load_shader(ctx, "lit_textured.vert.spv")?;
+        let frag_module = load_shader(ctx, "lit_textured.frag.spv")?;
         let entry_name = CString::new("main").unwrap();
         let vert_stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
@@ -982,6 +1301,12 @@ impl Pipeline {
             .binding(0)
             .stride(std::mem::size_of::<Vertex>() as u32)
             .input_rate(vk::VertexInputRate::VERTEX)];
+        // Vertex layout: pos (12B) + color (12B) + normal (12B) + uv (8B)
+        // = 44 bytes. uv is a vec2 of f32 (8 bytes, 4-byte aligned) and
+        // starts at offset 24 + 12 = 36. Struct is Pod-compatible (no
+        // internal padding) but its size 44 isn't a multiple of 4
+        // (44 % 4 == 0 actually — 44/4 == 11, so it IS 4-aligned; no
+        // trailing pad needed either).
         let vertex_attrs = [
             vk::VertexInputAttributeDescription::default()
                 .location(0).binding(0)
@@ -995,6 +1320,10 @@ impl Pipeline {
                 .location(2).binding(0)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(24),
+            vk::VertexInputAttributeDescription::default()
+                .location(3).binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(36),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vertex_bindings)
@@ -1068,8 +1397,17 @@ impl Pipeline {
             .offset(0)
             .size(std::mem::size_of::<[f32; 32]>() as u32)];
 
+        // Caller-supplied descriptor set layout (the Backend pre-creates
+        // it so it can also pre-allocate + update the descriptor set with
+        // the texture before this pipeline is built — lavapipe wants the
+        // sampler to exist when create_graphics_pipelines lowers the
+        // texture-sample op to LLVM IR).
+        let dsl_create_unused = vk::DescriptorSetLayoutCreateInfo::default();
+        let _ = dsl_create_unused;
+
         let layout_create = vk::PipelineLayoutCreateInfo::default()
-            .push_constant_ranges(&pc_ranges);
+            .push_constant_ranges(&pc_ranges)
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout));
         let pipeline_layout = unsafe {
             ctx.device.create_pipeline_layout(&layout_create, None)
                 .map_err(|e| RenderError::Pipeline(format!("create_pipeline_layout: {:?}", e)))?
@@ -1100,6 +1438,7 @@ impl Pipeline {
             render_pass,
             pipeline,
             pipeline_layout,
+            descriptor_set_layout,
             vert_module,
             frag_module,
         })
@@ -1109,6 +1448,7 @@ impl Pipeline {
         unsafe {
             ctx.device.destroy_pipeline(self.pipeline, None);
             ctx.device.destroy_pipeline_layout(self.pipeline_layout, None);
+            ctx.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             ctx.device.destroy_render_pass(self.render_pass, None);
             ctx.device.destroy_shader_module(self.vert_module, None);
             ctx.device.destroy_shader_module(self.frag_module, None);
@@ -1642,6 +1982,10 @@ pub struct Backend {
     pub pipeline: Pipeline,
     pub frame: Frame,
     pub mesh: CubeMesh,
+    pub plane_mesh: Mesh,
+    pub texture: Texture,
+    pub descriptor_pool: vk::DescriptorPool,
+    pub descriptor_set: vk::DescriptorSet,
     pub observatory: Observatory,
     pub readback: Buffer,
     pub width: u32,
@@ -1667,7 +2011,68 @@ impl Backend {
 
         let swapchain = HeadlessSwapchain::new(ctx.clone(), width, height)?;
         let depth = DepthBuffer::new(&ctx, swapchain.extent)?;
-        let pipeline = Pipeline::new(&ctx, swapchain.format, depth.format, swapchain.extent)?;
+        // Order matters here: the lit_textured pipeline samples a bound
+        // texture in the fragment shader, and lavapipe (CPU Vulkan) wants
+        // the descriptor set + texture bound BEFORE create_graphics_pipelines
+        // is called — it lowers the texture sample to LLVM IR at pipeline
+        // build time, and that lowering can segfault if no VkSampler exists
+        // yet. So we create the texture + descriptor pool + descriptor set
+        // FIRST, then build the pipeline that references the descriptor
+        // set layout. The descriptor_set_layout itself is created inside
+        // Pipeline::new, but the layout object only describes the shape;
+        // the actual binding data is filled by update_descriptor_sets here
+        // before pipeline creation runs.
+        //
+        // Workaround: pre-create the descriptor_set_layout inline so we
+        // can allocate + update the set before the pipeline references it.
+        let binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .immutable_samplers(&[]);
+        let dsl_create = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(std::slice::from_ref(&binding));
+        let pre_dsl = unsafe {
+            ctx.device.create_descriptor_set_layout(&dsl_create, None)
+                .map_err(|e| RenderError::Pipeline(format!("pre-create_descriptor_set_layout: {:?}", e)))?
+        };
+        let texture = Texture::new_checker(&ctx)?;
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)];
+        let pool_create = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::empty())
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        let descriptor_pool = unsafe {
+            ctx.device.create_descriptor_pool(&pool_create, None)
+                .map_err(|e| RenderError::Pipeline(format!("create_descriptor_pool: {:?}", e)))?
+        };
+        let set_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(std::slice::from_ref(&pre_dsl));
+        let descriptor_set = unsafe {
+            ctx.device.allocate_descriptor_sets(&set_alloc)
+                .map_err(|e| RenderError::Pipeline(format!("allocate_descriptor_sets: {:?}", e)))?[0]
+        };
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(texture.view)
+            .sampler(texture.sampler);
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&image_info))];
+        unsafe { ctx.device.update_descriptor_sets(&writes, &[]); }
+        log::info!(
+            "texture + descriptor set pre-created before pipeline (lavapipe lowering requirement)"
+        );
+        let pipeline = Pipeline::new(
+            &ctx, swapchain.format, depth.format, swapchain.extent, pre_dsl,
+        )?;
         let frame = Frame::new(
             &ctx,
             swapchain.extent,
@@ -1677,6 +2082,8 @@ impl Backend {
             2,
         )?;
         let mesh = CubeMesh::new(&ctx)?;
+        let plane_mesh = PlaneMesh::new(&ctx, 20.0, 20.0)?.mesh;
+
         let observatory = Observatory::start(observatory_addr);
 
         let bytes_needed = (width as u64) * (height as u64) * 4;
@@ -1694,6 +2101,10 @@ impl Backend {
             pipeline,
             frame,
             mesh,
+            plane_mesh,
+            texture,
+            descriptor_pool,
+            descriptor_set,
             observatory,
             readback,
             width,
@@ -1703,12 +2114,11 @@ impl Backend {
 
     pub fn render_one(&mut self, frame_index: u64) -> RenderResult<()> {
         // Default single-cube scene for backwards compatibility: a single
-        // cube at the origin rotating around Y. Real scenes should call
-        // `render_objects` with a list of model matrices instead.
+        // cube at the origin rotating around Y.
         use arcane_math::Mat4;
         let angle = (frame_index as f32) * 0.05;
         let model = Mat4::from_rotation_y(angle);
-        self.render_objects(frame_index, std::slice::from_ref(&model))
+        self.render_scene(frame_index, &[SceneInstance::new(MeshKind::Cube, model)])
     }
 
     /// Render a scene containing many cube instances, each transformed by
@@ -1720,10 +2130,13 @@ impl Backend {
     /// framebuffer dimensions (so the aspect ratio is always right). The
     /// camera sits at (0, 0, +5) in world space looking at the origin
     /// with a 60 degree vertical FOV.
-    pub fn render_objects(
+    /// Render a scene of mixed primitives. Each entry picks one of the
+    /// Backend-owned meshes (cube, plane) and a model matrix. The push
+    /// constant per draw is view_proj + model (128 bytes).
+    pub fn render_scene(
         &mut self,
         frame_index: u64,
-        models: &[arcane_math::Mat4],
+        scene: &[SceneInstance],
     ) -> RenderResult<()> {
         use arcane_math::{Mat4, Vec3, mat4_to_cols_array, vulkan_perspective};
 
@@ -1736,18 +2149,19 @@ impl Backend {
         );
         let view: Mat4 = Mat4::from_translation(Vec3::new(0.0, 0.0, -5.0));
         let view_proj: Mat4 = proj * view;
-        // Precompute the per-instance push-constant payload: 32 f32s =
-        // view_proj (cols, 16) followed by model (cols, 16). The recording
-        // loop just casts each entry to a byte slice for cmd_push_constants.
         let view_proj_cols = mat4_to_cols_array(view_proj);
-        let per_instance: Vec<[f32; 32]> = models
+
+        // Precompute per-instance push-constant payload + resolve the
+        // mesh each instance draws. Storing the mesh kind here keeps the
+        // record_draw loop pure w.r.t. self (only touches GPU state).
+        let per_instance: Vec<([f32; 32], MeshKind)> = scene
             .iter()
-            .map(|m| {
-                let model_cols = mat4_to_cols_array(*m);
+            .map(|inst| {
+                let model_cols = mat4_to_cols_array(inst.model);
                 let mut buf = [0.0f32; 32];
                 buf[..16].copy_from_slice(&view_proj_cols);
                 buf[16..32].copy_from_slice(&model_cols);
-                buf
+                (buf, inst.mesh)
             })
             .collect();
 
@@ -1803,11 +2217,26 @@ impl Backend {
         Ok(())
     }
 
+    /// Legacy entry kept for source-level backwards compatibility. Maps a
+    /// list of (MeshKind, Mat4) tuples to a SceneInstance slice and
+    /// delegates to render_scene.
+    pub fn render_objects(
+        &mut self,
+        frame_index: u64,
+        scene: &[(MeshKind, arcane_math::Mat4)],
+    ) -> RenderResult<()> {
+        let instances: Vec<SceneInstance> = scene
+            .iter()
+            .map(|(kind, m)| SceneInstance::new(*kind, *m))
+            .collect();
+        self.render_scene(frame_index, &instances)
+    }
+
     fn record_draw(
         &self,
         cmd: vk::CommandBuffer,
         image_index: u32,
-        per_instance: &[[f32; 32]],
+        per_instance: &[([f32; 32], MeshKind)],
     ) -> RenderResult<()> {
         let extent = self.swapchain.extent;
         let framebuffer = self.frame.framebuffers[image_index as usize];
@@ -1847,13 +2276,31 @@ impl Backend {
                 .map_err(|e| RenderError::Other(format!("begin_command_buffer: {:?}", e)))?;
             self.ctx.device.cmd_begin_render_pass(cmd, &render_begin, vk::SubpassContents::INLINE);
             self.ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline.pipeline);
-            self.ctx.device.cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.mesh.mesh.vertex.raw), &[0]);
-            self.ctx.device.cmd_bind_index_buffer(cmd, self.mesh.mesh.index.raw, 0, vk::IndexType::UINT16);
+            // Bind the descriptor set (texture) once for the whole render
+            // pass. All draws use the same texture at set 0 binding 0.
+            self.ctx.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline.pipeline_layout,
+                0,
+                std::slice::from_ref(&self.descriptor_set),
+                &[],
+            );
 
-            // Per-instance loop: push view_proj + model (128 bytes),
-            // then draw. The pipeline, vertex buffer, and index buffer
-            // are bound once outside the loop (Vulkan bind-once-draw-many).
-            for pc in per_instance {
+            // Per-instance loop: bind that instance's vertex/index buffers,
+            // push view_proj + model (128 bytes), then draw. The pipeline,
+            // descriptor set, and texture are bound once outside the loop.
+            for (pc, kind) in per_instance {
+                let mesh = match kind {
+                    MeshKind::Cube => &self.mesh.mesh,
+                    MeshKind::Plane => &self.plane_mesh,
+                };
+                self.ctx.device.cmd_bind_vertex_buffers(
+                    cmd, 0, std::slice::from_ref(&mesh.vertex.raw), &[0],
+                );
+                self.ctx.device.cmd_bind_index_buffer(
+                    cmd, mesh.index.raw, 0, vk::IndexType::UINT16,
+                );
                 let pc_bytes: &[u8] = std::slice::from_raw_parts(
                     pc.as_ptr() as *const u8,
                     std::mem::size_of::<[f32; 32]>(),
@@ -1865,7 +2312,7 @@ impl Backend {
                     0,
                     pc_bytes,
                 );
-                self.ctx.device.cmd_draw_indexed(cmd, self.mesh.mesh.index_count, 1, 0, 0, 0);
+                self.ctx.device.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
             }
             self.ctx.device.cmd_end_render_pass(cmd);
             self.ctx.device.end_command_buffer(cmd)
@@ -1994,7 +2441,10 @@ impl Drop for Backend {
         // Drop order is the reverse of construction:
         //   readback (host buffer)
         //   mesh (vertex/index buffers)
-        //   pipeline (graphics pipeline + render pass + shaders + pipeline layout)
+        //   plane_mesh (vertex/index buffers)
+        //   texture (image + view + sampler + memory)
+        //   descriptor_pool (frees all descriptor sets)
+        //   pipeline (graphics pipeline + render pass + shaders + pipeline layout + dsl)
         //   frame (framebuffers + sync objects + command pool)
         //   depth (depth image + view + memory)
         //   swapchain (surface + image views + raw swapchain)
@@ -2003,6 +2453,9 @@ impl Drop for Backend {
         // Backend is consumed.
         self.readback.destroy(&self.ctx);
         self.mesh.destroy(&self.ctx);
+        self.plane_mesh.destroy(&self.ctx);
+        self.texture.destroy(&self.ctx);
+        unsafe { self.ctx.device.destroy_descriptor_pool(self.descriptor_pool, None); }
         self.pipeline.destroy(&self.ctx);
         self.frame.destroy(&self.ctx);
         self.depth.destroy(&self.ctx);

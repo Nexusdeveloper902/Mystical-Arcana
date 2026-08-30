@@ -149,3 +149,25 @@ Stage Summary:
 - Lit pipeline renders 40 frames cleanly with no validation errors. PNG output grew from 14 KB (flat per-face colors) to 16 KB (lit with gradients) — indicates the lighting is actually creating visible color variance.
 - Vertex format now supports normals; cube mesh exports correct per-face normals; renderer passes both view_proj and model via 128-byte push constant so vertex shader transforms normals into world space and fragment shader applies ambient + Lambertian diffuse + rim term.
 - All committed on local main + pushed to remote renderer-vulkan branch (commit 88360f2 = chore cleanup; commit ? = Phase E completion). Future phases will continue pushing to renderer-vulkan.
+
+---
+Task ID: 5-textured-meshes
+Agent: main (super-z)
+Task: Phase F — Textured meshes via descriptor set + sampler + procedural checker + ground plane.
+
+Work Log:
+- Added UV (vec2 f32) to Vertex struct: pos (12) + color (12) + normal (12) + uv (8) = 44 bytes (4-byte aligned, Pod-compatible).
+- Wrote new shader pair lit_textured.{vert,frag}: vertex shader passes UV through to fragment shader; fragment shader multiplies v_color by a procedural checker pattern computed in-shader, then applies the same ambient + diffuse + rim lighting from Phase E.
+- Added a Texture struct (VkImage + ImageView + Sampler + DeviceMemory) with new_checker constructor that uploads a 64x64 RGBA 8x8 checkerboard via staging buffer + one-shot command buffer + layout transitions (UNDEFINED → TRANSFER_DST → SHADER_READ_ONLY_OPTIMAL).
+- Added DescriptorSetLayout + DescriptorPool + DescriptorSet to the pipeline and backend. The descriptor set layout declares one binding (combined image sampler, FRAGMENT stage) at set 0 binding 0; the descriptor pool allocates one set; the set is updated with the texture's image view + sampler at the binding.
+- Added PlaneMesh: 4 verts, 6 indices, ground plane at y=0 facing +Y, UVs tiled 8x so the procedural checker reads as a ground texture.
+- Added MeshKind enum + SceneInstance struct so the renderer's render_scene() takes a slice of (MeshKind, Mat4) entries rather than mesh references — this avoids the borrow conflict where the caller would otherwise need to borrow &self.mesh while calling &mut self.render_objects.
+- Updated main.rs to render a 5-object scene: ground plane (MeshKind::Plane at y=-2) + 4 cubes (MeshKind::Cube at various positions/rotations).
+- lavapipe bug discovered: create_graphics_pipelines segfaults inside libvulkan_lvp.so when the fragment shader actually calls texture(sampler2D, vec2). Verified by binary-searching the shader: minimal vert (no UV in) + minimal frag (declares sampler but no texture call) works; minimal frag with texture() call crashes. The descriptor set + sampler + image view are all correctly bound (update_descriptor_sets ran before pipeline creation in the reordered init), so this is a NIR→LLVM lowering bug in lavapipe, not a Vulkan validation issue.
+- Workaround: replaced texture() sampling with a procedural checker computed in-shader (floor(uv*8) + mod 2 + mix). Visual effect is the same — checker pattern on the ground plane and on the cube faces — but no texture() call so no lavapipe crash. The full descriptor set + sampler + texture image infrastructure is still wired through (kept for a future host with a conformant GPU).
+- Backend::with_observatory reorders init: creates descriptor_set_layout + texture + descriptor_pool + descriptor_set BEFORE Pipeline::new, then passes the pre-created descriptor_set_layout into Pipeline::new so the pipeline can reference it. (This was the attempted fix for the lavapipe bug — didn't actually fix the crash, but is still the correct order for the future when texture sampling works.)
+
+Stage Summary:
+- Renderer now supports: per-vertex normals, ambient+diffuse+rim directional light, procedural checker pattern via UV, ground plane mesh, cube mesh, multi-mesh scenes via MeshKind enum, descriptor set + sampler + texture image plumbing.
+- 20-frame smoke test renders cleanly with no validation errors. PNG output grew from 16 KB (Phase E flat lighting) to 19 KB (Phase F with checker pattern) — extra variance from the checker.
+- Phase F committed as 'phase F (textured meshes): UV + procedural checker + ground plane + descriptor set' on local main, pushed to origin/renderer-vulkan.
