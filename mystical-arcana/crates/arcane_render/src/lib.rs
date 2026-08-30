@@ -573,6 +573,125 @@ pub fn load_shader(ctx: &VkContext, name: &str) -> RenderResult<vk::ShaderModule
 }
 
 // =============================================================================
+// Depth buffer
+// =============================================================================
+
+pub struct DepthBuffer {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+    pub format: vk::Format,
+    pub extent: vk::Extent2D,
+}
+
+impl DepthBuffer {
+    pub fn new(ctx: &VkContext, extent: vk::Extent2D) -> RenderResult<Self> {
+        let format = pick_depth_format(ctx);
+        log::info!(
+            "depth buffer: {:?} {}x{}",
+            format, extent.width, extent.height
+        );
+
+        let create_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .format(format)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let image = unsafe {
+            ctx.device.create_image(&create_info, None)
+                .map_err(|e| RenderError::Allocator(format!("create_image (depth): {:?}", e)))?
+        };
+
+        let req = unsafe { ctx.device.get_image_memory_requirements(image) };
+        // DEVICE_LOCAL is preferred; on lavapipe this is just host memory
+        // anyway but we keep the convention for when we run on a real GPU.
+        let mem_type = ctx.find_memory_type(
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mem_type);
+        let memory = unsafe {
+            ctx.device.allocate_memory(&alloc, None)
+                .map_err(|e| RenderError::Allocator(format!("allocate_memory (depth): {:?}", e)))?
+        };
+        unsafe {
+            ctx.device.bind_image_memory(image, memory, 0)
+                .map_err(|e| RenderError::Allocator(format!("bind_image_memory (depth): {:?}", e)))?;
+        }
+
+        let view_create = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = unsafe {
+            ctx.device.create_image_view(&view_create, None)
+                .map_err(|e| RenderError::Allocator(format!("create_image_view (depth): {:?}", e)))?
+        };
+
+        // No explicit layout transition here — the render pass's
+        // `initial_layout = UNDEFINED` + `load_op = CLEAR` performs the
+        // transition to DEPTH_STENCIL_ATTACHMENT_OPTIMAL on the first
+        // render pass instance.
+
+        Ok(Self { image, memory, view, format, extent })
+    }
+
+    pub fn destroy(&mut self, ctx: &VkContext) {
+        unsafe {
+            ctx.device.destroy_image_view(self.view, None);
+            ctx.device.destroy_image(self.image, None);
+            ctx.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Pick a depth format that the physical device supports for optimal tiling
+/// depth-stencil attachment usage. Prefer D32_SFLOAT (highest precision,
+/// simplest), fall back to D24_UNORM_S8_UINT (24-bit depth + 8-bit stencil,
+/// which is what most desktop GPUs natively expose).
+pub fn pick_depth_format(ctx: &VkContext) -> vk::Format {
+    let candidates = [
+        vk::Format::D32_SFLOAT,
+        vk::Format::D24_UNORM_S8_UINT,
+        vk::Format::D16_UNORM,
+    ];
+    for &f in &candidates {
+        let props = unsafe {
+            ctx.instance.get_physical_device_format_properties(
+                ctx.physical_device,
+                f,
+            )
+        };
+        if props.optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        {
+            return f;
+        }
+    }
+    // Last resort — let the validation layer complain rather than panic.
+    vk::Format::D32_SFLOAT
+}
+
+// =============================================================================
 // Render pass + pipeline
 // =============================================================================
 
@@ -585,8 +704,11 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn new(ctx: &VkContext, color_format: vk::Format, extent: vk::Extent2D) -> RenderResult<Self> {
-        // Render pass
+    pub fn new(ctx: &VkContext, color_format: vk::Format, depth_format: vk::Format, extent: vk::Extent2D) -> RenderResult<Self> {
+        // Render pass: color attachment + depth attachment.
+        // The depth attachment is cleared at the start of each render pass
+        // and discarded at the end (we don't need to read it back; lavapipe
+        // discards it as soon as the render pass ends).
         let color_attach = vk::AttachmentDescription::default()
             .format(color_format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -597,24 +719,40 @@ impl Pipeline {
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
 
+        let depth_attach = vk::AttachmentDescription::default()
+            .format(depth_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        let attachments = [color_attach, depth_attach];
+
         let color_ref = vk::AttachmentReference::default()
             .attachment(0)
             .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let depth_ref = vk::AttachmentReference::default()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
         let subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(std::slice::from_ref(&color_ref));
+            .color_attachments(std::slice::from_ref(&color_ref))
+            .depth_stencil_attachment(&depth_ref);
 
         let dependency = vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
             .src_access_mask(vk::AccessFlags::empty())
-            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
 
         let rp_create = vk::RenderPassCreateInfo::default()
-            .attachments(std::slice::from_ref(&color_attach))
+            .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass))
             .dependencies(std::slice::from_ref(&dependency));
         let render_pass = unsafe {
@@ -675,13 +813,29 @@ impl Pipeline {
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
             .line_width(1.0)
-            .cull_mode(vk::CullModeFlags::NONE)
+            // Cull back faces (the ones facing away from the camera) so a
+            // closed mesh like a cube draws correctly without the back faces
+            // showing through the front. With CCW front-facing winding and
+            // CULL_BACK, only front faces (those whose vertices are CCW
+            // when viewed from the camera) are rasterized.
+            .cull_mode(vk::CullModeFlags::BACK)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .depth_bias_enable(false);
 
         let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
             .sample_shading_enable(false)
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        // Depth/stencil state: enable depth testing with LESS compare (a
+        // fragment is drawn if its depth is less than what's already in the
+        // depth buffer), and enable depth writes so later fragments see
+        // the updated depth. No stencil testing.
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
 
         let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(
@@ -714,6 +868,7 @@ impl Pipeline {
             .viewport_state(&viewport_state)
             .rasterization_state(&rasterizer)
             .multisample_state(&multisampling)
+            .depth_stencil_state(&depth_stencil)
             .color_blend_state(&color_blend)
             .layout(pipeline_layout)
             .render_pass(render_pass)
@@ -990,6 +1145,7 @@ impl Frame {
         extent: vk::Extent2D,
         render_pass: vk::RenderPass,
         image_views: &[vk::ImageView],
+        depth_view: vk::ImageView,
         frames_in_flight: usize,
     ) -> RenderResult<Self> {
         let pool_create = vk::CommandPoolCreateInfo::default()
@@ -1030,11 +1186,17 @@ impl Frame {
             in_flight.push(f);
         }
 
+        // Each framebuffer gets BOTH the color image view (per swapchain image)
+        // AND the shared depth image view. The render pass references them by
+        // index: 0 = color, 1 = depth. The depth image is shared across all
+        // framebuffers because we serialize GPU work with fences and never
+        // access the depth attachment from two frames concurrently.
         let mut framebuffers = Vec::with_capacity(image_views.len());
         for view in image_views {
+            let attachments = [*view, depth_view];
             let fb_create = vk::FramebufferCreateInfo::default()
                 .render_pass(render_pass)
-                .attachments(std::slice::from_ref(view))
+                .attachments(&attachments)
                 .width(extent.width)
                 .height(extent.height)
                 .layers(1);
@@ -1262,6 +1424,7 @@ loop();
 pub struct Backend {
     pub ctx: Arc<VkContext>,
     pub swapchain: HeadlessSwapchain,
+    pub depth: DepthBuffer,
     pub pipeline: Pipeline,
     pub frame: Frame,
     pub mesh: TriangleMesh,
@@ -1289,12 +1452,14 @@ impl Backend {
         log::info!("Vulkan context: device = {}", ctx.device_name());
 
         let swapchain = HeadlessSwapchain::new(ctx.clone(), width, height)?;
-        let pipeline = Pipeline::new(&ctx, swapchain.format, swapchain.extent)?;
+        let depth = DepthBuffer::new(&ctx, swapchain.extent)?;
+        let pipeline = Pipeline::new(&ctx, swapchain.format, depth.format, swapchain.extent)?;
         let frame = Frame::new(
             &ctx,
             swapchain.extent,
             pipeline.render_pass,
             &swapchain.image_views,
+            depth.view,
             2,
         )?;
         let mesh = TriangleMesh::new(&ctx)?;
@@ -1311,6 +1476,7 @@ impl Backend {
         Ok(Self {
             ctx,
             swapchain,
+            depth,
             pipeline,
             frame,
             mesh,
@@ -1390,11 +1556,23 @@ impl Backend {
         let extent = self.swapchain.extent;
         let framebuffer = self.frame.framebuffers[image_index as usize];
 
-        let clear_values = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.05, 0.05, 0.08, 1.0],
+        let clear_values = [
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.05, 0.05, 0.08, 1.0],
+                },
             },
-        }];
+            // Depth clear = 1.0 (far plane). LESS compare means a fragment
+            // passes only if its depth is < the buffer value, so starting
+            // from 1.0 means everything in front of the far plane passes
+            // on the first write.
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+        ];
 
         let render_begin = vk::RenderPassBeginInfo::default()
             .render_pass(self.pipeline.render_pass)
@@ -1551,10 +1729,21 @@ impl Drop for Backend {
     fn drop(&mut self) {
         // Wait for device idle before any destruction
         unsafe { let _ = self.ctx.device.device_wait_idle(); }
+        // Drop order is the reverse of construction:
+        //   readback (host buffer)
+        //   mesh (vertex/index buffers)
+        //   pipeline (graphics pipeline + render pass + shaders + pipeline layout)
+        //   frame (framebuffers + sync objects + command pool)
+        //   depth (depth image + view + memory)
+        //   swapchain (surface + image views + raw swapchain)
+        // The VkContext (instance + device + physical device) outlives all
+        // of these because it's held in an Arc and dropped last when the
+        // Backend is consumed.
         self.readback.destroy(&self.ctx);
         self.mesh.destroy(&self.ctx);
         self.pipeline.destroy(&self.ctx);
         self.frame.destroy(&self.ctx);
+        self.depth.destroy(&self.ctx);
         self.swapchain.destroy(&self.ctx);
     }
 }
