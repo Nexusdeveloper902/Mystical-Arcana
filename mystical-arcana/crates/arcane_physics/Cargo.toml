@@ -1,0 +1,11 @@
+[package]
+name = "arcane_physics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+glam.workspace = true
+arcane_math = { path = "../arcane_math" }
+arcane_ecs = { path = "../arcane_ecs" }

@@ -1,0 +1,12 @@
+[package]
+name = "asset_pipeline"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "asset_pipeline"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true

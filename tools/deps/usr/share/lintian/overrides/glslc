@@ -1,0 +1,2 @@
+# There are big tables in the man page:
+glslc: groff-message troff:* break line [usr/share/man/man1/glslc.1.gz:1]

@@ -1,0 +1,9 @@
+[package]
+name = "arcane_math"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+glam.workspace = true

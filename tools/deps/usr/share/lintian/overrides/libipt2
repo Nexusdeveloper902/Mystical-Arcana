@@ -1,0 +1,1 @@
+libipt2: hardening-no-fortify-functions [usr/lib/x86_64-linux-gnu/libipt.so.*]

@@ -1,0 +1,8 @@
+[package]
+name = "arcane_world"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true

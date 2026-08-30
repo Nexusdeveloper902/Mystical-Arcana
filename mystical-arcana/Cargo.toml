@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arcane_math",
+    "crates/arcane_core",
+    "crates/arcane_ecs",
+    "crates/arcane_render",
+    "crates/arcane_world",
+    "crates/arcane_assets",
+    "crates/arcane_audio",
+    "crates/arcane_physics",
+    "crates/arcane_input",
+    "crates/arcane_ui",
+    "crates/arcane_vfx",
+    "crates/game",
+    "crates/asset_pipeline",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Mystical Arcana contributors"]
+publish = false
+
+[workspace.dependencies]
+# Vulkan / GPU
+ash = "0.38"
+ash-window = "0.13"
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+# Logging / error / utils
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+thiserror = "1"
+# Math
+glam = "0.29"
+# Asset / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+# Concurrency / collections
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+# Profiling
+puffin = "0.19"
+# Image / asset
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp"] }
+# Window / OS (we run headless but still want raw input glue)
+raw-window-handle = "0.6"
+# wgpu not allowed — the directive is to render with real Vulkan via ash.
+# HTTP server for the browser Render Observatory
+tiny_http = "0.12"
+# Deterministic hashing for asset cache
+ahash = "0.8"
+# Compile-time resources for the binary
+rust-embed = { version = "8", features = ["compression"] }
+
+[profile.release]
+debug = true  # Keep debug symbols for stack traces even in release builds
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+panic = "unwind"  # Don't abort — we want full stack traces on crash
+
+[profile.dev]
+opt-level = 1
+debug = true

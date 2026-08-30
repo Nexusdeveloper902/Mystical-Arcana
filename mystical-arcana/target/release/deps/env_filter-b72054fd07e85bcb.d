@@ -1,0 +1,12 @@
+/home/z/my-project/mystical-arcana/target/release/deps/env_filter-b72054fd07e85bcb.d: /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/lib.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/directive.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/filter.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/filtered_log.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/op.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/parser.rs
+
+/home/z/my-project/mystical-arcana/target/release/deps/libenv_filter-b72054fd07e85bcb.rlib: /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/lib.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/directive.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/filter.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/filtered_log.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/op.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/parser.rs
+
+/home/z/my-project/mystical-arcana/target/release/deps/libenv_filter-b72054fd07e85bcb.rmeta: /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/lib.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/directive.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/filter.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/filtered_log.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/op.rs /home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/parser.rs
+
+/home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/lib.rs:
+/home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/directive.rs:
+/home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/filter.rs:
+/home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/filtered_log.rs:
+/home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/op.rs:
+/home/z/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/env_filter-2.0.0/src/parser.rs:

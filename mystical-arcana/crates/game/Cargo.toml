@@ -1,0 +1,27 @@
+[package]
+name = "mystical_arcana"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mystical_arcana"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+tiny_http.workspace = true
+arcane_math = { path = "../arcane_math" }
+arcane_core = { path = "../arcane_core" }
+arcane_ecs = { path = "../arcane_ecs" }
+arcane_render = { path = "../arcane_render" }
+arcane_world = { path = "../arcane_world" }
+arcane_assets = { path = "../arcane_assets" }
+arcane_input = { path = "../arcane_input" }
+arcane_ui = { path = "../arcane_ui" }
+arcane_vfx = { path = "../arcane_vfx" }
+arcane_physics = { path = "../arcane_physics" }

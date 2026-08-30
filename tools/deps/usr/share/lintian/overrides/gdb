@@ -1,0 +1,9 @@
+# These are false positives.
+spelling-error-in-binary nott not [usr/bin/gdb]
+spelling-error-in-binary wtH with [usr/bin/gdb]
+
+# This is obviously intentional.  The manpages are non-DFSG.
+no-manual-page [usr/bin/gdb-add-index]
+no-manual-page [usr/bin/gdb]
+no-manual-page [usr/bin/gdbtui]
+no-manual-page [usr/bin/gstack]
