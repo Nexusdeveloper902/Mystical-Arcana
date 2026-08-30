@@ -57,6 +57,8 @@ ahash = "0.8"
 rust-embed = { version = "8", features = ["compression"] }
 # signal-hook — reliable cross-platform signal handling (SIGINT for clean shutdown)
 signal-hook = "0.3"
+# bytemuck — zero-copy casting of &[T] to &[u8] for mesh upload
+bytemuck = { version = "1", features = ["derive"] }
 
 [profile.release]
 debug = true  # Keep debug symbols for stack traces even in release builds

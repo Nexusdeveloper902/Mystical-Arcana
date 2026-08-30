@@ -67,3 +67,33 @@ pub fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
 pub fn look_at(eye: Vec3, center: Vec3, up: Vec3) -> Mat4 {
     Mat4::look_at_rh(eye, center, up)
 }
+
+/// Vulkan-style perspective projection (right-handed view space, depth
+/// range [0, 1] in NDC, Y points down on screen).
+///
+/// This differs from `glam::Mat4::perspective_rh` (which uses the OpenGL
+/// depth range [-1, +1]). The matrix maps view-space z = -near to NDC z = 0
+/// (the near plane) and view-space z = -far to NDC z = 1 (the far plane).
+///
+/// Column-major layout matches GLSL `mat4` so the result can be uploaded
+/// directly as a 64-byte push constant.
+pub fn vulkan_perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+    let f = 1.0 / (fovy / 2.0).tan();
+    let m22 = far / (near - far);
+    let m32 = -1.0;
+    let m23 = -(far * near) / (far - near);
+    // Column-major: 4 columns of 4 elements each.
+    Mat4::from_cols_array(&[
+        f / aspect, 0.0, 0.0, 0.0,
+        0.0,        f,   0.0, 0.0,
+        0.0,        0.0, m22, m32,
+        0.0,        0.0, m23, 0.0,
+    ])
+}
+
+/// Convert a glam Mat4 to a column-major `[f32; 16]` for upload as a push
+/// constant or uniform buffer. This matches GLSL's `mat4` layout so the
+/// shader can read the matrix without any transpose flag.
+pub fn mat4_to_cols_array(m: Mat4) -> [f32; 16] {
+    m.to_cols_array()
+}

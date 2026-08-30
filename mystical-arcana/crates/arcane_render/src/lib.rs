@@ -486,7 +486,7 @@ impl Buffer {
 // =============================================================================
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub pos: [f32; 3],
     pub color: [f32; 3],
@@ -506,42 +506,226 @@ impl TriangleMesh {
             Vertex { pos: [ 0.0,  0.5, 0.0], color: [0.0, 0.0, 1.0] },
         ];
         let indices: [u16; 3] = [0, 1, 2];
-
-        let v_size = std::mem::size_of_val(&vertices) as vk::DeviceSize;
-        let i_size = std::mem::size_of_val(&indices) as vk::DeviceSize;
-
-        // Use HOST_VISIBLE|HOST_COHERENT for both vertex and index buffers
-        // since lavapipe is CPU-backed anyway. For a real GPU we'd stage through
-        // a transfer queue.
-        let mut vertex = Buffer::new(
-            ctx, v_size,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        vertex.write_bytes(unsafe {
-            std::slice::from_raw_parts(
-                vertices.as_ptr() as *const u8,
-                std::mem::size_of_val(&vertices),
-            )
-        })?;
-        let mut index = Buffer::new(
-            ctx, i_size,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        index.write_bytes(unsafe {
-            std::slice::from_raw_parts(
-                indices.as_ptr() as *const u8,
-                std::mem::size_of_val(&indices),
-            )
-        })?;
-
-        Ok(Self { vertex, index, index_count: indices.len() as u32 })
+        MeshBuilder::new(ctx)
+            .vertices(&vertices)
+            .indices_u16(&indices)
+            .build()
+            .map(|m| TriangleMesh { vertex: m.vertex, index: m.index, index_count: m.index_count })
     }
 
     pub fn destroy(&mut self, ctx: &VkContext) {
         self.vertex.destroy(ctx);
         self.index.destroy(ctx);
+    }
+}
+
+/// Generic mesh: vertex + index buffers + index count. Constructed by
+/// [`MeshBuilder`] from arbitrary vertex/index data. The caller owns the
+/// mesh and is responsible for calling [`Mesh::destroy`] before the
+/// underlying `VkContext` is dropped.
+pub struct Mesh {
+    pub vertex: Buffer,
+    pub index: Buffer,
+    pub index_count: u32,
+}
+
+impl Mesh {
+    pub fn destroy(&mut self, ctx: &VkContext) {
+        self.vertex.destroy(ctx);
+        self.index.destroy(ctx);
+    }
+}
+
+/// Builder for [`Mesh`]. Streams vertex + index data into HOST_VISIBLE
+/// HOST_COHERENT buffers (lavapipe is CPU-backed so this is fine; on a
+/// real GPU we'd stage through a transfer queue and a DEVICE_LOCAL buffer).
+pub struct MeshBuilder<'a> {
+    ctx: &'a VkContext,
+    vertices_bytes: Vec<u8>,
+    indices_u16: Vec<u16>,
+    indices_u32: Vec<u32>,
+    index_type: vk::IndexType,
+}
+
+impl<'a> MeshBuilder<'a> {
+    pub fn new(ctx: &'a VkContext) -> Self {
+        Self {
+            ctx,
+            vertices_bytes: Vec::new(),
+            indices_u16: Vec::new(),
+            indices_u32: Vec::new(),
+            index_type: vk::IndexType::UINT16,
+        }
+    }
+
+    /// Append a slice of vertices (any `#[repr(C)]` struct). The bytes are
+    /// copied as-is; the caller is responsible for matching the vertex
+    /// input binding description's stride and attribute offsets to the
+    /// struct's layout.
+    pub fn vertices<V: bytemuck::Pod>(mut self, vs: &[V]) -> Self {
+        let bytes: &[u8] = bytemuck::cast_slice(vs);
+        self.vertices_bytes.extend_from_slice(bytes);
+        self
+    }
+
+    pub fn indices_u16(mut self, idx: &[u16]) -> Self {
+        self.indices_u16.extend_from_slice(idx);
+        self.index_type = vk::IndexType::UINT16;
+        self
+    }
+
+    pub fn indices_u32(mut self, idx: &[u32]) -> Self {
+        self.indices_u32.extend_from_slice(idx);
+        self.index_type = vk::IndexType::UINT32;
+        self
+    }
+
+    pub fn build(self) -> RenderResult<Mesh> {
+        let v_size = self.vertices_bytes.len() as vk::DeviceSize;
+        if v_size == 0 {
+            return Err(RenderError::Allocator("mesh has no vertices".into()));
+        }
+
+        let (index_bytes, index_count, index_type) = if !self.indices_u16.is_empty() {
+            let bytes: &[u8] = bytemuck::cast_slice(&self.indices_u16);
+            (bytes.to_vec(), self.indices_u16.len() as u32, vk::IndexType::UINT16)
+        } else if !self.indices_u32.is_empty() {
+            let bytes: &[u8] = bytemuck::cast_slice(&self.indices_u32);
+            (bytes.to_vec(), self.indices_u32.len() as u32, vk::IndexType::UINT32)
+        } else {
+            (Vec::new(), 0, vk::IndexType::NONE_NV)
+        };
+
+        let mut vertex = Buffer::new(
+            self.ctx,
+            v_size.max(16),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        vertex.write_bytes(&self.vertices_bytes)?;
+
+        let index = if !index_bytes.is_empty() {
+            let i_size = index_bytes.len() as vk::DeviceSize;
+            let mut buf = Buffer::new(
+                self.ctx,
+                i_size,
+                vk::BufferUsageFlags::INDEX_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            buf.write_bytes(&index_bytes)?;
+            buf
+        } else {
+            // No indices — allocate a 16-byte placeholder so the buffer
+            // is valid even if the caller never binds it.
+            Buffer::new(
+                self.ctx,
+                16,
+                vk::BufferUsageFlags::INDEX_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?
+        };
+
+        let _ = index_type;
+        Ok(Mesh {
+            vertex,
+            index,
+            index_count,
+        })
+    }
+}
+
+/// A unit cube centered at the origin, with extents +/- 1 on each axis.
+/// Each face has a distinct per-vertex color (R/G/B/Cyan/Magenta/Yellow)
+/// so the cube is easy to visually inspect without textures or lighting.
+///
+/// Vertex layout per face: 4 vertices (bottom-left, bottom-right, top-right,
+/// top-left), wound CCW when viewed from outside the cube. Face order:
+///   0: +X (right)  — yellow
+///   1: -X (left)   — cyan
+///   2: +Y (bottom in Vulkan NDC, since Y points down) — magenta
+///   3: -Y (top)    — red
+///   4: +Z (front)  — green
+///   5: -Z (back)   — blue
+///
+/// With BACK-face culling + CCW front-face winding, only the outward-
+/// facing side of each face is rasterized, so the cube looks correct
+/// from any viewing angle.
+pub struct CubeMesh {
+    pub mesh: Mesh,
+}
+
+impl CubeMesh {
+    pub fn new(ctx: &VkContext) -> RenderResult<Self> {
+        // 24 vertices (4 per face x 6 faces) so each face has its own
+        // vertex colors and normals (no shared corners). Indexed by 36
+        // uint16s (2 triangles per face x 3 indices x 6 faces).
+        let s = 1.0f32;
+        let (rx, gx, bx) = (1.0f32, 0.0f32, 0.0f32); // not used
+        let _ = (rx, gx, bx);
+
+        // Per-face colors (sRGB-ish primaries for visual debugging):
+        let c_right  = [1.0, 1.0, 0.0]; // +X = yellow
+        let c_left   = [0.0, 1.0, 1.0]; // -X = cyan
+        let c_bottom = [1.0, 0.0, 1.0]; // +Y = magenta (Vulkan Y down → bottom)
+        let c_top    = [1.0, 0.0, 0.0]; // -Y = red
+        let c_front  = [0.0, 1.0, 0.0]; // +Z = green
+        let c_back   = [0.0, 0.0, 1.0]; // -Z = blue
+
+        // Vertex winding: each face is 4 verts in BL, BR, TR, TL order
+        // (CCW when viewed from outside). The two triangles per face are
+        // (BL, BR, TR) and (BL, TR, TL).
+        let mut verts: Vec<Vertex> = Vec::with_capacity(24);
+
+        // +X face (right)
+        verts.push(Vertex { pos: [ s, -s, -s], color: c_right  });
+        verts.push(Vertex { pos: [ s, -s,  s], color: c_right  });
+        verts.push(Vertex { pos: [ s,  s,  s], color: c_right  });
+        verts.push(Vertex { pos: [ s,  s, -s], color: c_right  });
+        // -X face (left)
+        verts.push(Vertex { pos: [-s, -s,  s], color: c_left   });
+        verts.push(Vertex { pos: [-s, -s, -s], color: c_left   });
+        verts.push(Vertex { pos: [-s,  s, -s], color: c_left   });
+        verts.push(Vertex { pos: [-s,  s,  s], color: c_left   });
+        // +Y face (bottom in Vulkan NDC)
+        verts.push(Vertex { pos: [-s,  s,  s], color: c_bottom });
+        verts.push(Vertex { pos: [-s,  s, -s], color: c_bottom });
+        verts.push(Vertex { pos: [ s,  s, -s], color: c_bottom });
+        verts.push(Vertex { pos: [ s,  s,  s], color: c_bottom });
+        // -Y face (top in Vulkan NDC)
+        verts.push(Vertex { pos: [-s, -s, -s], color: c_top    });
+        verts.push(Vertex { pos: [-s, -s,  s], color: c_top    });
+        verts.push(Vertex { pos: [ s, -s,  s], color: c_top    });
+        verts.push(Vertex { pos: [ s, -s, -s], color: c_top    });
+        // +Z face (front)
+        verts.push(Vertex { pos: [ s, -s,  s], color: c_front  });
+        verts.push(Vertex { pos: [-s, -s,  s], color: c_front  });
+        verts.push(Vertex { pos: [-s,  s,  s], color: c_front  });
+        verts.push(Vertex { pos: [ s,  s,  s], color: c_front  });
+        // -Z face (back)
+        verts.push(Vertex { pos: [-s, -s, -s], color: c_back   });
+        verts.push(Vertex { pos: [ s, -s, -s], color: c_back   });
+        verts.push(Vertex { pos: [ s,  s, -s], color: c_back   });
+        verts.push(Vertex { pos: [-s,  s, -s], color: c_back   });
+
+        // Per-face index pattern: 0,1,2,0,2,3 (relative to face base).
+        let face_idx = [0u16, 1, 2, 0, 2, 3];
+        let mut indices: Vec<u16> = Vec::with_capacity(36);
+        for f in 0..6u16 {
+            let base = f * 4;
+            for &i in &face_idx {
+                indices.push(base + i);
+            }
+        }
+
+        let mesh = MeshBuilder::new(ctx)
+            .vertices(&verts)
+            .indices_u16(&indices)
+            .build()?;
+        Ok(Self { mesh })
+    }
+
+    pub fn destroy(&mut self, ctx: &VkContext) {
+        self.mesh.destroy(ctx);
     }
 }
 
@@ -1427,7 +1611,7 @@ pub struct Backend {
     pub depth: DepthBuffer,
     pub pipeline: Pipeline,
     pub frame: Frame,
-    pub mesh: TriangleMesh,
+    pub mesh: CubeMesh,
     pub observatory: Observatory,
     pub readback: Buffer,
     pub width: u32,
@@ -1462,7 +1646,7 @@ impl Backend {
             depth.view,
             2,
         )?;
-        let mesh = TriangleMesh::new(&ctx)?;
+        let mesh = CubeMesh::new(&ctx)?;
         let observatory = Observatory::start(observatory_addr);
 
         let bytes_needed = (width as u64) * (height as u64) * 4;
@@ -1488,12 +1672,32 @@ impl Backend {
     }
 
     pub fn render_one(&mut self, frame_index: u64) -> RenderResult<()> {
-        let mvp: [f32; 16] = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
-        ];
+        // Compute the model-view-projection matrix for this frame.
+        //
+        // The MVP is proj * view * model, where:
+        //   proj  = Vulkan perspective (depth range [0, 1], Y down on screen)
+        //   view  = translate the world by (0, 0, -5) so the cube (extents
+        //           +/- 1 on each axis) sits 5 units in front of the camera
+        //   model = rotate around Y by frame_index * 0.05 rad/frame
+        //           (about 50 degrees per second at 1000 fps; slower at
+        //           the typical 60 fps demo rate)
+        //
+        // The result is uploaded as a 64-byte push constant that the
+        // vertex shader reads as `mat4 u_mvp` (column-major, no transpose).
+        use arcane_math::{Mat4, Vec3, mat4_to_cols_array, vulkan_perspective};
+
+        let aspect = self.width as f32 / self.height as f32;
+        let proj: Mat4 = vulkan_perspective(
+            60.0f32.to_radians(),
+            aspect,
+            0.1,
+            100.0,
+        );
+        let view: Mat4 = Mat4::from_translation(Vec3::new(0.0, 0.0, -5.0));
+        let angle = (frame_index as f32) * 0.05;
+        let model: Mat4 = Mat4::from_rotation_y(angle);
+        let mvp: Mat4 = proj * view * model;
+        let mvp: [f32; 16] = mat4_to_cols_array(mvp);
 
         let current = self.frame.current;
         let in_flight = self.frame.in_flight[current];
@@ -1591,8 +1795,8 @@ impl Backend {
                 .map_err(|e| RenderError::Other(format!("begin_command_buffer: {:?}", e)))?;
             self.ctx.device.cmd_begin_render_pass(cmd, &render_begin, vk::SubpassContents::INLINE);
             self.ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline.pipeline);
-            self.ctx.device.cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.mesh.vertex.raw), &[0]);
-            self.ctx.device.cmd_bind_index_buffer(cmd, self.mesh.index.raw, 0, vk::IndexType::UINT16);
+            self.ctx.device.cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.mesh.mesh.vertex.raw), &[0]);
+            self.ctx.device.cmd_bind_index_buffer(cmd, self.mesh.mesh.index.raw, 0, vk::IndexType::UINT16);
             let mvp_bytes: &[u8] = std::slice::from_raw_parts(
                 mvp.as_ptr() as *const u8,
                 std::mem::size_of::<[f32; 16]>(),
@@ -1604,7 +1808,7 @@ impl Backend {
                 0,
                 mvp_bytes,
             );
-            self.ctx.device.cmd_draw_indexed(cmd, self.mesh.index_count, 1, 0, 0, 0);
+            self.ctx.device.cmd_draw_indexed(cmd, self.mesh.mesh.index_count, 1, 0, 0, 0);
             self.ctx.device.cmd_end_render_pass(cmd);
             self.ctx.device.end_command_buffer(cmd)
                 .map_err(|e| RenderError::Other(format!("end_command_buffer: {:?}", e)))?;
