@@ -1,7 +1,5 @@
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
 use arcane_render::Backend;
 
 fn main() -> anyhow::Result<()> {
@@ -11,7 +9,7 @@ fn main() -> anyhow::Result<()> {
     log::info!("Mystical Arcana v0.1.0 — running on the Arcane engine");
 
     log::info!("initializing Vulkan renderer (lavapipe CPU driver expected on this host)");
-    let backend = Backend::new(800, 600).map_err(|e| {
+    let mut backend = Backend::new(800, 600).map_err(|e| {
         log::error!("backend init failed: {e:?}");
         anyhow::anyhow!(e.to_string())
     })?;

@@ -66,12 +66,11 @@ impl std::error::Error for RenderError {}
 
 impl From<vk::Result> for RenderError {
     fn from(r: vk::Result) -> Self {
-        use vk::Result::*;
         match r {
-            ERROR_INCOMPATIBLE_DRIVER => RenderError::IncompatibleDriver(format!("{:?}", r)),
-            ERROR_INITIALIZATION_FAILED => RenderError::InstanceCreate(format!("{:?}", r)),
-            ERROR_DEVICE_LOST => RenderError::DeviceCreate(format!("{:?}", r)),
-            ERROR_OUT_OF_DATE_KHR => RenderError::SwapchainCreate(format!("{:?}", r)),
+            vk::Result::ERROR_INCOMPATIBLE_DRIVER => RenderError::IncompatibleDriver(format!("{:?}", r)),
+            vk::Result::ERROR_INITIALIZATION_FAILED => RenderError::InstanceCreate(format!("{:?}", r)),
+            vk::Result::ERROR_DEVICE_LOST => RenderError::DeviceCreate(format!("{:?}", r)),
+            vk::Result::ERROR_OUT_OF_DATE_KHR => RenderError::SwapchainCreate(format!("{:?}", r)),
             _ => RenderError::Other(format!("vk::Result {:?}", r)),
         }
     }
@@ -108,9 +107,12 @@ pub fn validation_failed() -> bool {
 unsafe extern "system" fn messenger_callback(
     flags: vk::DebugUtilsMessageSeverityFlagsEXT,
     _types: vk::DebugUtilsMessageTypeFlagsEXT,
-    p_callback_data: *mut vk::DebugUtilsMessengerCallbackDataEXT,
+    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _user_data: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
+    // The pfn_user_callback expects Option<PFN_vkDebugUtilsMessengerCallbackEXT>.
+    // PFN's signature is exactly the same as ours. The Some(...) wrapping is
+    // done by the caller, not here.
     let data = &*p_callback_data;
     let message = if data.p_message.is_null() {
         "(no message)".to_string()
@@ -159,7 +161,7 @@ impl VkContext {
                 })
         };
         let want_validation = use_validation && available_layers.iter().any(|l| {
-            CStr::from_ptr(l.layer_name.as_ptr()).to_string_lossy().starts_with("VK_LAYER_KHRONOS")
+            unsafe { CStr::from_ptr(l.layer_name.as_ptr()).to_string_lossy().starts_with("VK_LAYER_KHRONOS") }
         });
         if use_validation && !want_validation {
             log::warn!("VK_LAYER_KHRONOS_validation not available — running without validation");
@@ -186,8 +188,8 @@ impl VkContext {
         };
         for ext in &extension_names {
             let present = available_exts.iter().any(|a| {
-                CStr::from_ptr(a.extension_name.as_ptr()).to_string_lossy()
-                    == ext.to_string_lossy()
+                let name = unsafe { CStr::from_ptr(a.extension_name.as_ptr()).to_string_lossy() };
+                name == ext.to_string_lossy()
             });
             if !present {
                 return Err(RenderError::InstanceCreate(format!(
@@ -224,6 +226,8 @@ impl VkContext {
                     | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
             )
             .pfn_user_callback(Some(messenger_callback));
+            // Some(fn_item) coerces to Option<PFN_...>. If the types differ in
+            // mutability, we use as `unsafe extern "system" fn(...)` directly.
         create_info.push_next(&mut debug_create);
 
         let instance = unsafe {
@@ -282,7 +286,7 @@ impl VkContext {
 
             log::info!(
                 "physical device: {:?} type={:?} device_local_memory={} MiB graphics_queue={}",
-                CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy(),
+                unsafe { CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy() },
                 props.device_type,
                 total_local / (1024 * 1024),
                 graphics_qf
@@ -300,7 +304,7 @@ impl VkContext {
         let (physical_device, physical_device_props, physical_device_features, device_memory_props, graphics_qf, _)
             = best.ok_or(RenderError::NoPhysicalDevice)?;
 
-        if !physical_device_features.geometry_shader {
+        if physical_device_features.geometry_shader == vk::FALSE {
             log::warn!("Selected physical device has no geometry shader");
         }
 
@@ -340,7 +344,7 @@ impl VkContext {
 
         log::info!(
             "Vulkan context ready: device={:?}",
-            CStr::from_ptr(physical_device_props.device_name.as_ptr()).to_string_lossy()
+            unsafe { CStr::from_ptr(physical_device_props.device_name.as_ptr()).to_string_lossy() }
         );
 
         Ok(Arc::new(Self {
@@ -440,11 +444,10 @@ impl Buffer {
                 .map_err(|e| RenderError::Allocator(format!("bind_buffer_memory: {:?}", e)))?;
         }
         let mapped = if properties.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            unsafe {
-                ctx.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty(), &mut ptr)
-                    .map_err(|e| RenderError::Allocator(format!("map_memory: {:?}", e)))?;
-            }
+            let ptr = unsafe {
+                ctx.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                    .map_err(|e| RenderError::Allocator(format!("map_memory: {:?}", e)))?
+            };
             Some(ptr)
         } else {
             None
@@ -537,10 +540,9 @@ impl TriangleMesh {
         Ok(Self { vertex, index, index_count: indices.len() as u32 })
     }
 
-    pub fn destroy(self, ctx: &VkContext) {
-        let mut me = self;
-        me.vertex.destroy(ctx);
-        me.index.destroy(ctx);
+    pub fn destroy(&mut self, ctx: &VkContext) {
+        self.vertex.destroy(ctx);
+        self.index.destroy(ctx);
     }
 }
 
@@ -825,7 +827,7 @@ impl HeadlessSwapchain {
         };
 
         log::info!(
-            "headless swapchain: {}x{} {} images={} present_mode={:?}",
+            "headless swapchain: {}x{} {:?} images={} present_mode={:?}",
             extent.width, extent.height, format.format, image_count, present_mode
         );
 
@@ -863,7 +865,7 @@ impl HeadlessSwapchain {
             .present_mode(present_mode)
             .clipped(true);
 
-        let swapchain_loader = ash::khr::swapchain::Device::new(&ctx.device);
+        let swapchain_loader = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
         let raw = unsafe {
             swapchain_loader.create_swapchain(&create_swap, None)
                 .map_err(|e| {
@@ -1092,9 +1094,10 @@ impl Observatory {
     pub fn start(addr: &str) -> Self {
         let latest: Arc<Mutex<FrameSnapshot>> = Arc::new(Mutex::new(FrameSnapshot::default()));
         let latest_inner = latest.clone();
+        let addr_owned: String = addr.to_string();
 
         let handle = std::thread::spawn(move || {
-            let server = match Server::http(addr) {
+            let server = match Server::http(addr_owned.as_str()) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Observatory server bind failed: {e:?}");
