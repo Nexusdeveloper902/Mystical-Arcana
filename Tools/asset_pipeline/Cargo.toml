@@ -1,0 +1,27 @@
+[package]
+name = "asset_pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Arcane Asset Pipeline — standalone cooking/validation tools"
+
+[[bin]]
+name = "arcane_cook"
+path = "src/main.rs"
+
+[lib]
+name = "asset_pipeline"
+path = "src/lib.rs"
+
+[dependencies]
+arcane_core = { path = "../../crates/arcane_core" }
+arcane_assets = { path = "../../crates/arcane_assets" }
+anyhow = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+pretty_assertions = { workspace = true }

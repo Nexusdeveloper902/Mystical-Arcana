@@ -1,0 +1,17 @@
+[package]
+name = "arcane_physics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Arcane engine: arcane_physics"
+
+[lib]
+name = "arcane_physics"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]

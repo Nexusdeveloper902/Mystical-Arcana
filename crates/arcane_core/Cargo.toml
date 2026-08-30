@@ -1,0 +1,44 @@
+[package]
+name = "arcane_core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Arcane engine core: logging, memory, threading, profiling, serialization"
+
+[lib]
+name = "arcane_core"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+ron = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+rayon = { workspace = true }
+once_cell = { workspace = true }
+hashbrown = { workspace = true }
+ahash = { workspace = true }
+smallvec = { workspace = true }
+bitflags = { workspace = true }
+bytemuck = { workspace = true }
+indexmap = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
+ron = { workspace = true }
+postcard = { workspace = true }
