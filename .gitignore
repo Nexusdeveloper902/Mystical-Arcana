@@ -1,3 +1,6 @@
 skills/
 node_modules/
 upload/
+tool-results/
+__pycache__/
+*.pyc
