@@ -185,6 +185,9 @@ name = "arcane_world"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arcane_math",
+ "arcane_render",
+ "glam",
  "log",
 ]
 

@@ -190,3 +190,29 @@ Stage Summary:
 - Camera: orbit at radius 8 around Y axis, looking at origin, +Y up.
 - 20-frame smoke test renders cleanly with no validation errors. PNG output grew from 19 KB (Phase F single cube + plane) to 44 KB (Phase G multi-primitive + orbit view) — significant visual richness increase.
 - Phase G committed on local main, pushed to origin/renderer-vulkan.
+
+---
+Task ID: 7-ecs-scene-graph
+Agent: main (super-z)
+Task: Phase H — Wire arcane_ecs + arcane_world for scene composition.
+
+Work Log:
+- Extended arcane_ecs::World with typed component queries via Box<dyn Any> downcasting:
+  * `get::<T>(e) -> Option<&T>` — read-only access, downcasts the first boxed component of type T.
+  * `get_mut::<T>(e) -> Option<&mut T>` — mutable access, downcasts mutably.
+  * `entities_with::<T>() -> Vec<Entity>` — collect all entities that currently have at least one component of type T.
+  * `count_components::<T>() -> usize` — sanity-check helper.
+- Added 3 ECS unit tests covering attach+get, get_mut updates in place, and entities_with filtering by component type. All pass.
+- Defined arcane_world::Transform component (position + rotation_y + scale) with `to_model_matrix()` that composes translation * rotation_y * scale as a Mat4 the renderer can push directly.
+- Defined arcane_world::MeshKindComponent(MeshKind) wrapping arcane_render::MeshKind for ECS storage.
+- Defined arcane_world::Spin { rate: f32 } component so the render loop can advance each spinning entity's rotation_y by rate per frame.
+- Rewrote main.rs scene composition: instead of a hard-coded `[Mat4; N]` array, build an arcane_ecs::World with 8 entities (ground plane + 4 cubes + 1 sphere + 2 pyramids). Each entity has Transform + MeshKindComponent. 7 of them also have a Spin component.
+- Per-frame ECS system: (1) collect spinning entities, (2) for each, advance Transform.rotation_y by Spin.rate, (3) iterate all entities with Transform, (4) build Vec<SceneInstance> from (MeshKind, Transform.to_model_matrix()) pairs, (5) pass to backend.render_scene.
+- Replaced `use arcane_math::{Mat4, Vec3}` with just `Vec3` (Transform owns the matrix math now; main.rs no longer needs Mat4 directly).
+
+Stage Summary:
+- arcane_ecs now supports typed component queries (downcast-based). 3 unit tests pass.
+- arcane_world hosts Transform + MeshKindComponent + Spin components.
+- main.rs scene composition is ECS-driven: 8 entities, 7 spinning. Per-frame system advances rotations and builds the scene slice for the renderer.
+- 20-frame smoke test: "ECS scene: 8 entities, 7 spinning", renders cleanly with no validation errors.
+- Phase H committed on local main, pushed to origin/renderer-vulkan.

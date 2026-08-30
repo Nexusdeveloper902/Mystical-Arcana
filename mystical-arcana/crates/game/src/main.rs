@@ -22,7 +22,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use arcane_ecs::World;
 use arcane_render::{validation_failed, Backend, MeshKind, SceneInstance};
+use arcane_world::{MeshKindComponent, Spin, Transform};
 
 /// Set to true by the SIGINT handler. The render loop polls this between
 /// frames so the Vulkan destructor sequence still runs (device_wait_idle →
@@ -100,15 +102,14 @@ fn main() -> anyhow::Result<()> {
     let mut validation_failed_count: u64 = 0;
     let mut render_error_count: u64 = 0;
 
-    // Build the scene: a ground plane + a row of three cubes plus a
-    // floating sphere + pyramid. Each object has a fixed world-space
-    // offset and rotates around Y at its own rate so the scene has
-    // visible motion between frames. The ground plane is a 20x20 unit
-    // plane drawn at y = -2 (just below the objects) and tiled 8x with
-    // the checker.
+    // Build the scene as an ECS world. Each entity has a Transform
+    // (position + rotation_y + scale) and a MeshKindComponent. Entities
+    // that should spin also get a Spin(rate). The render loop iterates
+    // the world each frame, advances each spinning entity's rotation,
+    // then builds the per-frame scene slice for the renderer.
     //
-    // Object layout (camera at eye rotating around Y, looking at origin):
-    //   [0] ground  20x20 at y=-2
+    // Object layout (camera orbits at radius 8 around Y, looking at origin):
+    //   [0] ground  20x20 at y=-2 (no spin)
     //   [1] center cube  (0, 0, 0) — slow spin
     //   [2] left cube   (-3, 0, 0) — fast spin
     //   [3] right cube  (+3, 0, 0) — reverse spin
@@ -116,46 +117,85 @@ fn main() -> anyhow::Result<()> {
     //   [5] sphere      (0, 0.5, -3) — counter-rotating around Y
     //   [6] pyramid     (-3, 0.5, -3) — slow spin
     //   [7] pyramid     (3, 0.5, -3) — reverse slow spin
-    use arcane_math::{Mat4, Vec3};
+    use arcane_math::Vec3;
+    let mut world = World::new();
+    {
+        // Ground plane (no spin).
+        let e = world.spawn();
+        world.attach(e, Transform::at(Vec3::new(0.0, -2.0, 0.0)));
+        world.attach(e, MeshKindComponent(MeshKind::Plane));
+        // Center cube.
+        let e = world.spawn();
+        world.attach(e, Transform::at(Vec3::new(0.0, 0.0, 0.0)));
+        world.attach(e, MeshKindComponent(MeshKind::Cube));
+        world.attach(e, Spin::new(0.05));
+        // Left cube.
+        let e = world.spawn();
+        world.attach(e, Transform::at(Vec3::new(-3.0, 0.0, 0.0)));
+        world.attach(e, MeshKindComponent(MeshKind::Cube));
+        world.attach(e, Spin::new(0.08));
+        // Right cube.
+        let e = world.spawn();
+        world.attach(e, Transform::at(Vec3::new(3.0, 0.0, 0.0)));
+        world.attach(e, MeshKindComponent(MeshKind::Cube));
+        world.attach(e, Spin::new(-0.04));
+        // Top cube (smaller).
+        let e = world.spawn();
+        world.attach(
+            e,
+            Transform::at(Vec3::new(0.0, 2.5, 0.0)).with_scale(Vec3::new(0.6, 0.6, 0.6)),
+        );
+        world.attach(e, MeshKindComponent(MeshKind::Cube));
+        world.attach(e, Spin::new(0.06));
+        // Sphere behind.
+        let e = world.spawn();
+        world.attach(e, Transform::at(Vec3::new(0.0, 0.5, -3.0)));
+        world.attach(e, MeshKindComponent(MeshKind::Sphere));
+        world.attach(e, Spin::new(-0.03));
+        // Left-back pyramid.
+        let e = world.spawn();
+        world.attach(e, Transform::at(Vec3::new(-3.0, 0.5, -3.0)));
+        world.attach(e, MeshKindComponent(MeshKind::Pyramid));
+        world.attach(e, Spin::new(0.04));
+        // Right-back pyramid.
+        let e = world.spawn();
+        world.attach(e, Transform::at(Vec3::new(3.0, 0.5, -3.0)));
+        world.attach(e, MeshKindComponent(MeshKind::Pyramid));
+        world.attach(e, Spin::new(-0.05));
+    }
+    log::info!("ECS scene: {} entities, {} spinning", world.count(), world.entities_with::<Spin>().len());
 
     while !STOP.load(Ordering::SeqCst) {
         if !forever && frame_index >= frame_cap {
             break;
         }
 
-        // Per-frame model matrices. Each object has a fixed translation
-        // and a Y rotation that increments with frame_index (so the scene
-        // animates without input). The plane model is just a translation
-        // down by 2 units — no rotation.
-        let t = frame_index as f32;
-        let plane_model = Mat4::from_translation(Vec3::new(0.0, -2.0, 0.0));
-        let scene_arr: [(MeshKind, Mat4); 7] = [
-            // [1] center cube: 0.05 rad/frame
-            (MeshKind::Cube, Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0))
-                * Mat4::from_rotation_y(t * 0.05)),
-            // [2] left cube: 0.08 rad/frame
-            (MeshKind::Cube, Mat4::from_translation(Vec3::new(-3.0, 0.0, 0.0))
-                * Mat4::from_rotation_y(t * 0.08)),
-            // [3] right cube: -0.04 rad/frame (reverse)
-            (MeshKind::Cube, Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0))
-                * Mat4::from_rotation_y(-t * 0.04)),
-            // [4] top cube: 0.06 rad/frame, scaled 0.6
-            (MeshKind::Cube, Mat4::from_translation(Vec3::new(0.0, 2.5, 0.0))
-                * Mat4::from_scale(Vec3::new(0.6, 0.6, 0.6))
-                * Mat4::from_rotation_y(t * 0.06)),
-            // [5] sphere: behind center, counter-rotating slowly
-            (MeshKind::Sphere, Mat4::from_translation(Vec3::new(0.0, 0.5, -3.0))
-                * Mat4::from_rotation_y(-t * 0.03)),
-            // [6] pyramid: left-behind, slow spin
-            (MeshKind::Pyramid, Mat4::from_translation(Vec3::new(-3.0, 0.5, -3.0))
-                * Mat4::from_rotation_y(t * 0.04)),
-            // [7] pyramid: right-behind, reverse spin
-            (MeshKind::Pyramid, Mat4::from_translation(Vec3::new(3.0, 0.5, -3.0))
-                * Mat4::from_rotation_y(-t * 0.05)),
-        ];
-        let scene: Vec<SceneInstance> = std::iter::once(SceneInstance::new(MeshKind::Plane, plane_model))
-            .chain(scene_arr.iter().map(|(k, m)| SceneInstance::new(*k, *m)))
-            .collect();
+        // Advance the ECS: each entity with a Spin component gets its
+        // Transform.rotation_y incremented by the spin rate.
+        let spinning = world.entities_with::<Spin>();
+        for e in spinning {
+            // Read the spin rate first (immutable borrow), then mutate
+            // the transform. The two-step borrow pattern keeps the borrow
+            // checker happy without cloning the world.
+            let rate = world.get::<Spin>(e).map(|s| s.rate).unwrap_or(0.0);
+            if let Some(t) = world.get_mut::<Transform>(e) {
+                t.rotation_y += rate;
+            }
+        }
+
+        // Build the per-frame scene slice from the ECS world.
+        let mut scene: Vec<SceneInstance> = Vec::with_capacity(world.count());
+        for e in world.entities_with::<Transform>() {
+            let (kind, model) = {
+                let kind = world.get::<MeshKindComponent>(e).map(|c| c.0);
+                let model = world.get::<Transform>(e).map(|t| t.to_model_matrix());
+                match (kind, model) {
+                    (Some(k), Some(m)) => (k, m),
+                    _ => continue,
+                }
+            };
+            scene.push(SceneInstance::new(kind, model));
+        }
 
         // Check for SIGINT once per frame; the cost is one SeqCst atomic
         // load (~1 ns) which is negligible next to a Vulkan frame.
