@@ -1,0 +1,800 @@
+     1→//! arcane_render — the Arcane engine's real Vulkan renderer.
+     2→//!
+     3→//! Consolidated into a single file so the ash 0.38 API surface can be
+     4→//! audited at a glance and the Vulkan object lifecycle is obvious.
+     5→//!
+     6→//! ## Object lifecycle
+     7→//!
+     8→//! Drop order is reverse-construction order:
+     9→//!   1. readback buffer + command buffer
+    10→//!   2. triangle vertex/index buffers
+    11→//!   3. graphics pipeline + shader modules + pipeline layout
+    12→//!   4. framebuffers
+    13→//!   5. render pass
+    14→//!   6. frame (command buffers + sync objects)
+    15→//!   7. swapchain + image views + surface
+    16→//!   8. logical device
+    17→//!   9. debug messenger
+    18→//!  10. instance
+    19→//!
+    20→//! All Vulkan handles are stored as `vk::X` raw handles (not owning wrappers),
+    21→//! because the parent `VkContext` is kept alive in an `Arc` until the very end.
+    22→//! This is the simplest way to keep the Drop sequence right without fighting
+    23→//! the borrow checker for cross-references between wrappers.
+    24→
+    25→use std::borrow::Cow;
+    26→use std::ffi::{CStr, CString};
+    27→use std::sync::Arc;
+    28→
+    29→use ash::ext::{debug_utils, headless_surface};
+    30→use ash::vk;
+    31→use parking_lot::Mutex;
+    32→use tiny_http::{Header, Response, Server};
+    33→
+    34→// =============================================================================
+    35→// Error type
+    36→// =============================================================================
+    37→
+    38→#[derive(Debug)]
+    39→pub enum RenderError {
+    40→    LoaderNotFound(String),
+    41→    InstanceCreate(String),
+    42→    NoPhysicalDevice,
+    43→    DeviceCreate(String),
+    44→    QueueFamily(String),
+    45→    SurfaceCreate(String),
+    46→    SwapchainCreate(String),
+    47→    AcquireImage(String),
+    48→    Submit(String),
+    49→    Present(String),
+    50→    Shader(String),
+    51→    Pipeline(String),
+    52→    Allocator(String),
+    53→    Validation(String),
+    54→    IncompatibleDriver(String),
+    55→    Other(String),
+    56→}
+    57→
+    58→impl std::fmt::Display for RenderError {
+    59→    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    60→        write!(f, "{:?}", self)
+    61→    }
+    62→}
+    63→
+    64→impl std::error::Error for RenderError {}
+    65→
+    66→impl From<vk::Result> for RenderError {
+    67→    fn from(r: vk::Result) -> Self {
+    68→        match r {
+    69→            vk::Result::ERROR_INCOMPATIBLE_DRIVER => RenderError::IncompatibleDriver(format!("{:?}", r)),
+    70→            vk::Result::ERROR_INITIALIZATION_FAILED => RenderError::InstanceCreate(format!("{:?}", r)),
+    71→            vk::Result::ERROR_DEVICE_LOST => RenderError::DeviceCreate(format!("{:?}", r)),
+    72→            vk::Result::ERROR_OUT_OF_DATE_KHR => RenderError::SwapchainCreate(format!("{:?}", r)),
+    73→            _ => RenderError::Other(format!("vk::Result {:?}", r)),
+    74→        }
+    75→    }
+    76→}
+    77→
+    78→pub type RenderResult<T> = Result<T, RenderError>;
+    79→
+    80→// =============================================================================
+    81→// Vulkan context: entry, instance, debug messenger, physical device, device
+    82→// =============================================================================
+    83→
+    84→pub struct VkContext {
+    85→    pub entry: Arc<ash::Entry>,
+    86→    pub instance: ash::Instance,
+    87→    pub debug_utils_loader: Option<debug_utils::Instance>,
+    88→    pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
+    89→    pub physical_device: vk::PhysicalDevice,
+    90→    pub physical_device_props: vk::PhysicalDeviceProperties,
+    91→    pub physical_device_features: vk::PhysicalDeviceFeatures,
+    92→    pub device_memory_props: vk::PhysicalDeviceMemoryProperties,
+    93→    pub device: ash::Device,
+    94→    pub graphics_queue_family: u32,
+    95→    pub graphics_queue: vk::Queue,
+    96→    pub surface_loader: Option<ash::khr::surface::Instance>,
+    97→}
+    98→
+    99→static VALIDATION_FAILED: std::sync::atomic::AtomicBool =
+   100→    std::sync::atomic::AtomicBool::new(false);
+   101→
+   102→pub fn validation_failed() -> bool {
+   103→    VALIDATION_FAILED.load(std::sync::atomic::Ordering::SeqCst)
+   104→}
+   105→
+   106→unsafe extern "system" fn messenger_callback(
+   107→    flags: vk::DebugUtilsMessageSeverityFlagsEXT,
+   108→    _types: vk::DebugUtilsMessageTypeFlagsEXT,
+   109→    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+   110→    _user_data: *mut std::ffi::c_void,
+   111→) -> vk::Bool32 {
+   112→    // The pfn_user_callback expects Option<PFN_vkDebugUtilsMessengerCallbackEXT>.
+   113→    // PFN's signature is exactly the same as ours. The Some(...) wrapping is
+   114→    // done by the caller, not here.
+   115→    let data = &*p_callback_data;
+   116→    let message = if data.p_message.is_null() {
+   117→        "(no message)".to_string()
+   118→    } else {
+   119→        CStr::from_ptr(data.p_message).to_string_lossy().to_string()
+   120→    };
+   121→
+   122→    let prefix = if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+   123→        "[VK error]"
+   124→    } else if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+   125→        "[VK warn]"
+   126→    } else if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
+   127→        "[VK info]"
+   128→    } else {
+   129→        "[VK verbose]"
+   130→    };
+   131→
+   132→    let full = format!("{} {}", prefix, message);
+   133→
+   134→    if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+   135→        log::error!("{}", full);
+   136→        VALIDATION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+   137→    } else if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+   138→        log::warn!("{}", full);
+   139→    } else if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
+   140→        log::info!("{}", full);
+   141→    } else {
+   142→        log::debug!("{}", full);
+   143→    }
+   144→
+   145→    vk::FALSE
+   146→}
+   147→
+   148→impl VkContext {
+   149→    pub fn new(app_name: &str, use_validation: bool) -> RenderResult<Arc<Self>> {
+   150→        let entry = unsafe { ash::Entry::load() }
+   151→            .map_err(|e| RenderError::LoaderNotFound(e.to_string()))?;
+   152→        let entry = Arc::new(entry);
+   153→
+   154→        // enumerate available instance layers
+   155→        let available_layers = unsafe {
+   156→            entry.enumerate_instance_layer_properties()
+   157→                .unwrap_or_else(|e| {
+   158→                    log::warn!("enumerate_instance_layer_properties failed: {:?}", e);
+   159→                    Vec::new()
+   160→                })
+   161→        };
+   162→        let want_validation = use_validation && available_layers.iter().any(|l| {
+   163→            unsafe { CStr::from_ptr(l.layer_name.as_ptr()).to_string_lossy().starts_with("VK_LAYER_KHRONOS") }
+   164→        });
+   165→        if use_validation && !want_validation {
+   166→            log::warn!("VK_LAYER_KHRONOS_validation not available — running without validation");
+   167→        }
+   168→
+   169→        let mut layer_names: Vec<CString> = Vec::new();
+   170→        if want_validation {
+   171→            layer_names.push(CString::new("VK_LAYER_KHRONOS_validation").unwrap());
+   172→        }
+   173→        let layers_ptrs: Vec<*const i8> = layer_names.iter().map(|n| n.as_ptr()).collect();
+   174→
+   175→        // extensions: debug_utils + headless_surface + KHR_surface
+   176→        let mut extension_names: Vec<CString> = Vec::new();
+   177→        extension_names.push(CString::new("VK_EXT_debug_utils").unwrap());
+   178→        extension_names.push(CString::new("VK_EXT_headless_surface").unwrap());
+   179→        extension_names.push(CString::new("VK_KHR_surface").unwrap());
+   180→
+   181→        let available_exts = unsafe {
+   182→            entry.enumerate_instance_extension_properties(None)
+   183→                .unwrap_or_else(|e| {
+   184→                    log::warn!("enumerate_instance_extension_properties failed: {:?}", e);
+   185→                    Vec::new()
+   186→                })
+   187→        };
+   188→        for ext in &extension_names {
+   189→            let present = available_exts.iter().any(|a| {
+   190→                let name = unsafe { CStr::from_ptr(a.extension_name.as_ptr()).to_string_lossy() };
+   191→                name == ext.to_string_lossy()
+   192→            });
+   193→            if !present {
+   194→                return Err(RenderError::InstanceCreate(format!(
+   195→                    "Required instance extension not available: {}", ext.to_string_lossy()
+   196→                )));
+   197→            }
+   198→        }
+   199→        let ext_ptrs: Vec<*const i8> = extension_names.iter().map(|n| n.as_ptr()).collect();
+   200→
+   201→        let app_name_c = CString::new(app_name).unwrap();
+   202→        let engine_name_c = CString::new("Arcane").unwrap();
+   203→        let app_info = vk::ApplicationInfo::default()
+   204→            .application_name(&app_name_c)
+   205→            .application_version(vk::make_api_version(0, 0, 1, 0))
+   206→            .engine_name(&engine_name_c)
+   207→            .engine_version(vk::make_api_version(0, 0, 1, 0))
+   208→            .api_version(vk::API_VERSION_1_3);
+   209→
+   210→        let create_info = vk::InstanceCreateInfo::default()
+   211→            .application_info(&app_info)
+   212→            .enabled_layer_names(&layers_ptrs)
+   213→            .enabled_extension_names(&ext_ptrs);
+   214→
+   215→        let mut debug_create = vk::DebugUtilsMessengerCreateInfoEXT::default()
+   216→            .flags(vk::DebugUtilsMessengerCreateFlagsEXT::empty())
+   217→            .message_severity(
+   218→                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+   219→                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+   220→                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
+   221→            )
+   222→            .message_type(
+   223→                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+   224→                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+   225→                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+   226→            )
+   227→            .pfn_user_callback(Some(messenger_callback));
+   228→            // Some(fn_item) coerces to Option<PFN_...>. If the types differ in
+   229→            // mutability, we use as `unsafe extern "system" fn(...)` directly.
+   230→        let _ = create_info.push_next(&mut debug_create);
+   231→
+   232→        let instance = unsafe {
+   233→            entry.create_instance(&create_info, None)
+   234→                .map_err(|e| {
+   235→                    log::error!("vkCreateInstance failed: {:?}", e);
+   236→                    RenderError::InstanceCreate(format!("{:?}", e))
+   237→                })?
+   238→        };
+   239→
+   240→        let (debug_utils_loader, debug_messenger) = if want_validation {
+   241→            let loader = debug_utils::Instance::new(&entry, &instance);
+   242→            let messenger = unsafe {
+   243→                loader.create_debug_utils_messenger(&debug_create, None)
+   244→                    .map_err(|e| RenderError::Validation(format!(
+   245→                        "create_debug_utils_messenger: {:?}", e
+   246→                    )))?
+   247→            };
+   248→            (Some(loader), Some(messenger))
+   249→        } else {
+   250→            (None, None)
+   251→        };
+   252→
+   253→        // physical device selection
+   254→        let physicals = unsafe {
+   255→            instance.enumerate_physical_devices()
+   256→                .map_err(|e| RenderError::Other(format!("enumerate_physical_devices: {:?}", e)))?
+   257→        };
+   258→        if physicals.is_empty() {
+   259→            return Err(RenderError::NoPhysicalDevice);
+   260→        }
+   261→
+   262→        let mut best: Option<(vk::PhysicalDevice, vk::PhysicalDeviceProperties, vk::PhysicalDeviceFeatures, vk::PhysicalDeviceMemoryProperties, u32, u64)> = None;
+   263→        for pd in physicals {
+   264→            let props = unsafe { instance.get_physical_device_properties(pd) };
+   265→            let features = unsafe { instance.get_physical_device_features(pd) };
+   266→            let mem_props = unsafe { instance.get_physical_device_memory_properties(pd) };
+   267→            let qfams = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+   268→
+   269→            let mut graphics_fam = None;
+   270→            for (i, q) in qfams.iter().enumerate() {
+   271→                if q.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+   272→                    graphics_fam = Some(i as u32);
+   273→                    break;
+   274→                }
+   275→            }
+   276→            let graphics_qf = match graphics_fam {
+   277→                Some(g) => g,
+   278→                None => continue,
+   279→            };
+   280→
+   281→            let total_local = (0..mem_props.memory_heap_count as usize)
+   282→                .filter(|i| mem_props.memory_heaps[*i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+   283→                .map(|i| mem_props.memory_heaps[i].size)
+   284→                .sum::<u64>();
+   285→
+   286→            log::info!(
+   287→                "physical device: {:?} type={:?} device_local_memory={} MiB graphics_queue={}",
+   288→                unsafe { CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy() },
+   289→                props.device_type,
+   290→                total_local / (1024 * 1024),
+   291→                graphics_qf
+   292→            );
+   293→
+   294→            let is_better = match &best {
+   295→                None => true,
+   296→                Some((.., b_total)) => total_local > *b_total,
+   297→            };
+   298→            if is_better {
+   299→                best = Some((pd, props, features, mem_props, graphics_qf, total_local));
+   300→            }
+   301→        }
+   302→
+   303→        let (physical_device, physical_device_props, physical_device_features, device_memory_props, graphics_qf, _)
+   304→            = best.ok_or(RenderError::NoPhysicalDevice)?;
+   305→
+   306→        if physical_device_features.geometry_shader == vk::FALSE {
+   307→            log::warn!("Selected physical device has no geometry shader");
+   308→        }
+   309→
+   310→        // logical device
+   311→        let queue_priorities = [1.0f32];
+   312→        let graphics_create = vk::DeviceQueueCreateInfo::default()
+   313→            .queue_family_index(graphics_qf)
+   314→            .queue_priorities(&queue_priorities);
+   315→
+   316→        let mut desired_features = vk::PhysicalDeviceFeatures::default();
+   317→        desired_features.geometry_shader = physical_device_features.geometry_shader;
+   318→        desired_features.fill_mode_non_solid = physical_device_features.fill_mode_non_solid;
+   319→        desired_features.shader_clip_distance = physical_device_features.shader_clip_distance;
+   320→        desired_features.wide_lines = physical_device_features.wide_lines;
+   321→        desired_features.depth_clamp = physical_device_features.depth_clamp;
+   322→        desired_features.sampler_anisotropy = physical_device_features.sampler_anisotropy;
+   323→
+   324→        // VK_KHR_swapchain is required to create a swapchain (even on a
+   325→        // headless surface — it is the only present path).
+   326→        // On Vulkan 1.1+ it may be promoted but it's still a device extension.
+   327→        let swap_ext = CString::new("VK_KHR_swapchain").unwrap();
+   328→        let device_extensions: [*const i8; 1] = [swap_ext.as_ptr()];
+   329→        let device_create_info = vk::DeviceCreateInfo::default()
+   330→            .queue_create_infos(std::slice::from_ref(&graphics_create))
+   331→            .enabled_extension_names(&device_extensions)
+   332→            .enabled_features(&desired_features);
+   333→
+   334→        let device = unsafe {
+   335→            instance.create_device(physical_device, &device_create_info, None)
+   336→                .map_err(|e| {
+   337→                    log::error!("vkCreateDevice failed: {:?}", e);
+   338→                    RenderError::DeviceCreate(format!("{:?}", e))
+   339→                })?
+   340→        };
+   341→
+   342→        let graphics_queue = unsafe { device.get_device_queue(graphics_qf, 0) };
+   343→
+   344→        log::info!(
+   345→            "Vulkan context ready: device={:?}",
+   346→            unsafe { CStr::from_ptr(physical_device_props.device_name.as_ptr()).to_string_lossy() }
+   347→        );
+   348→
+   349→        Ok(Arc::new(Self {
+   350→            entry,
+   351→            instance,
+   352→            debug_utils_loader,
+   353→            debug_messenger,
+   354→            physical_device,
+   355→            physical_device_props,
+   356→            physical_device_features,
+   357→            device_memory_props,
+   358→            device,
+   359→            graphics_queue_family: graphics_qf,
+   360→            graphics_queue,
+   361→            surface_loader: None,
+   362→        }))
+   363→    }
+   364→
+   365→    pub fn device_name(&self) -> String {
+   366→        unsafe { CStr::from_ptr(self.physical_device_props.device_name.as_ptr()) }
+   367→            .to_string_lossy().to_string()
+   368→    }
+   369→
+   370→    pub fn find_memory_type(
+   371→        &self,
+   372→        type_bits: u32,
+   373→        properties: vk::MemoryPropertyFlags,
+   374→    ) -> RenderResult<u32> {
+   375→        for i in 0..self.device_memory_props.memory_type_count {
+   376→            let bit = (type_bits >> i) & 1;
+   377→            if bit == 1 {
+   378→                let flags = self.device_memory_props.memory_types[i as usize].property_flags;
+   379→                if flags.contains(properties) {
+   380→                    return Ok(i);
+   381→                }
+   382→            }
+   383→        }
+   384→        Err(RenderError::Allocator(format!(
+   385→            "No memory type matching type_bits={:#x} properties={:?}",
+   386→            type_bits, properties
+   387→        )))
+   388→    }
+   389→}
+   390→
+   391→impl Drop for VkContext {
+   392→    fn drop(&mut self) {
+   393→        unsafe {
+   394→            if let (Some(loader), Some(messenger)) =
+   395→                (self.debug_utils_loader.as_ref(), self.debug_messenger.take())
+   396→            {
+   397→                let _ = loader.destroy_debug_utils_messenger(messenger, None);
+   398→            }
+   399→            self.device.destroy_device(None);
+   400→            self.instance.destroy_instance(None);
+   401→        }
+   402→    }
+   403→}
+   404→
+   405→// =============================================================================
+   406→// Buffer
+   407→// =============================================================================
+   408→
+   409→pub struct Buffer {
+   410→    pub raw: vk::Buffer,
+   411→    pub memory: vk::DeviceMemory,
+   412→    pub size: vk::DeviceSize,
+   413→    pub mapped: Option<*mut std::ffi::c_void>,
+   414→    pub memory_props: vk::MemoryPropertyFlags,
+   415→}
+   416→
+   417→impl Buffer {
+   418→    pub fn new(
+   419→        ctx: &VkContext,
+   420→        size: vk::DeviceSize,
+   421→        usage: vk::BufferUsageFlags,
+   422→        properties: vk::MemoryPropertyFlags,
+   423→    ) -> RenderResult<Self> {
+   424→        let create = vk::BufferCreateInfo::default()
+   425→            .size(size)
+   426→            .usage(usage)
+   427→            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+   428→        let raw = unsafe {
+   429→            ctx.device.create_buffer(&create, None)
+   430→                .map_err(|e| RenderError::Allocator(format!("create_buffer: {:?}", e)))?
+   431→        };
+   432→        let req = unsafe { ctx.device.get_buffer_memory_requirements(raw) };
+   433→        let mem_type = ctx.find_memory_type(req.memory_type_bits, properties)?;
+   434→        let alloc = vk::MemoryAllocateInfo::default()
+   435→            .allocation_size(req.size)
+   436→            .memory_type_index(mem_type);
+   437→        let memory = unsafe {
+   438→            ctx.device.allocate_memory(&alloc, None)
+   439→                .map_err(|e| RenderError::Allocator(format!("allocate_memory: {:?}", e)))?
+   440→        };
+   441→        unsafe {
+   442→            ctx.device.bind_buffer_memory(raw, memory, 0)
+   443→                .map_err(|e| RenderError::Allocator(format!("bind_buffer_memory: {:?}", e)))?;
+   444→        }
+   445→        let mapped = if properties.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
+   446→            let ptr = unsafe {
+   447→                ctx.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+   448→                    .map_err(|e| RenderError::Allocator(format!("map_memory: {:?}", e)))?
+   449→            };
+   450→            Some(ptr)
+   451→        } else {
+   452→            None
+   453→        };
+   454→        Ok(Self { raw, memory, size, mapped, memory_props: properties })
+   455→    }
+   456→
+   457→    pub fn write_bytes(&mut self, bytes: &[u8]) -> RenderResult<()> {
+   458→        let p = self.mapped.ok_or_else(|| RenderError::Allocator("buffer not mapped".into()))?;
+   459→        unsafe {
+   460→            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+   461→        }
+   462→        Ok(())
+   463→    }
+   464→
+   465→    pub fn read_bytes(&self) -> &[u8] {
+   466→        match self.mapped {
+   467→            Some(p) => unsafe { std::slice::from_raw_parts(p as *const u8, self.size as usize) },
+   468→            None => &[],
+   469→        }
+   470→    }
+   471→
+   472→    pub fn destroy(&mut self, ctx: &VkContext) {
+   473→        if self.mapped.is_some() {
+   474→            unsafe { ctx.device.unmap_memory(self.memory); }
+   475→            self.mapped = None;
+   476→        }
+   477→        unsafe {
+   478→            ctx.device.destroy_buffer(self.raw, None);
+   479→            ctx.device.free_memory(self.memory, None);
+   480→        }
+   481→    }
+   482→}
+   483→
+   484→// =============================================================================
+   485→// Vertex / Mesh
+   486→// =============================================================================
+   487→
+   488→#[repr(C)]
+   489→#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+   490→pub struct Vertex {
+   491→    pub pos: [f32; 3],
+   492→    pub color: [f32; 3],
+   493→}
+   494→
+   495→pub struct TriangleMesh {
+   496→    pub vertex: Buffer,
+   497→    pub index: Buffer,
+   498→    pub index_count: u32,
+   499→}
+   500→
+   501→impl TriangleMesh {
+   502→    pub fn new(ctx: &VkContext) -> RenderResult<Self> {
+   503→        let vertices: [Vertex; 3] = [
+   504→            Vertex { pos: [ 0.5, -0.5, 0.0], color: [1.0, 0.0, 0.0] },
+   505→            Vertex { pos: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0] },
+   506→            Vertex { pos: [ 0.0,  0.5, 0.0], color: [0.0, 0.0, 1.0] },
+   507→        ];
+   508→        let indices: [u16; 3] = [0, 1, 2];
+   509→        MeshBuilder::new(ctx)
+   510→            .vertices(&vertices)
+   511→            .indices_u16(&indices)
+   512→            .build()
+   513→            .map(|m| TriangleMesh { vertex: m.vertex, index: m.index, index_count: m.index_count })
+   514→    }
+   515→
+   516→    pub fn destroy(&mut self, ctx: &VkContext) {
+   517→        self.vertex.destroy(ctx);
+   518→        self.index.destroy(ctx);
+   519→    }
+   520→}
+   521→
+   522→/// Generic mesh: vertex + index buffers + index count. Constructed by
+   523→/// [`MeshBuilder`] from arbitrary vertex/index data. The caller owns the
+   524→/// mesh and is responsible for calling [`Mesh::destroy`] before the
+   525→/// underlying `VkContext` is dropped.
+   526→pub struct Mesh {
+   527→    pub vertex: Buffer,
+   528→    pub index: Buffer,
+   529→    pub index_count: u32,
+   530→}
+   531→
+   532→impl Mesh {
+   533→    pub fn destroy(&mut self, ctx: &VkContext) {
+   534→        self.vertex.destroy(ctx);
+   535→        self.index.destroy(ctx);
+   536→    }
+   537→}
+   538→
+   539→/// Builder for [`Mesh`]. Streams vertex + index data into HOST_VISIBLE
+   540→/// HOST_COHERENT buffers (lavapipe is CPU-backed so this is fine; on a
+   541→/// real GPU we'd stage through a transfer queue and a DEVICE_LOCAL buffer).
+   542→pub struct MeshBuilder<'a> {
+   543→    ctx: &'a VkContext,
+   544→    vertices_bytes: Vec<u8>,
+   545→    indices_u16: Vec<u16>,
+   546→    indices_u32: Vec<u32>,
+   547→    index_type: vk::IndexType,
+   548→}
+   549→
+   550→impl<'a> MeshBuilder<'a> {
+   551→    pub fn new(ctx: &'a VkContext) -> Self {
+   552→        Self {
+   553→            ctx,
+   554→            vertices_bytes: Vec::new(),
+   555→            indices_u16: Vec::new(),
+   556→            indices_u32: Vec::new(),
+   557→            index_type: vk::IndexType::UINT16,
+   558→        }
+   559→    }
+   560→
+   561→    /// Append a slice of vertices (any `#[repr(C)]` struct). The bytes are
+   562→    /// copied as-is; the caller is responsible for matching the vertex
+   563→    /// input binding description's stride and attribute offsets to the
+   564→    /// struct's layout.
+   565→    pub fn vertices<V: bytemuck::Pod>(mut self, vs: &[V]) -> Self {
+   566→        let bytes: &[u8] = bytemuck::cast_slice(vs);
+   567→        self.vertices_bytes.extend_from_slice(bytes);
+   568→        self
+   569→    }
+   570→
+   571→    pub fn indices_u16(mut self, idx: &[u16]) -> Self {
+   572→        self.indices_u16.extend_from_slice(idx);
+   573→        self.index_type = vk::IndexType::UINT16;
+   574→        self
+   575→    }
+   576→
+   577→    pub fn indices_u32(mut self, idx: &[u32]) -> Self {
+   578→        self.indices_u32.extend_from_slice(idx);
+   579→        self.index_type = vk::IndexType::UINT32;
+   580→        self
+   581→    }
+   582→
+   583→    pub fn build(self) -> RenderResult<Mesh> {
+   584→        let v_size = self.vertices_bytes.len() as vk::DeviceSize;
+   585→        if v_size == 0 {
+   586→            return Err(RenderError::Allocator("mesh has no vertices".into()));
+   587→        }
+   588→
+   589→        let (index_bytes, index_count, index_type) = if !self.indices_u16.is_empty() {
+   590→            let bytes: &[u8] = bytemuck::cast_slice(&self.indices_u16);
+   591→            (bytes.to_vec(), self.indices_u16.len() as u32, vk::IndexType::UINT16)
+   592→        } else if !self.indices_u32.is_empty() {
+   593→            let bytes: &[u8] = bytemuck::cast_slice(&self.indices_u32);
+   594→            (bytes.to_vec(), self.indices_u32.len() as u32, vk::IndexType::UINT32)
+   595→        } else {
+   596→            (Vec::new(), 0, vk::IndexType::NONE_NV)
+   597→        };
+   598→
+   599→        let mut vertex = Buffer::new(
+   600→            self.ctx,
+   601→            v_size.max(16),
+   602→            vk::BufferUsageFlags::VERTEX_BUFFER,
+   603→            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+   604→        )?;
+   605→        vertex.write_bytes(&self.vertices_bytes)?;
+   606→
+   607→        let index = if !index_bytes.is_empty() {
+   608→            let i_size = index_bytes.len() as vk::DeviceSize;
+   609→            let mut buf = Buffer::new(
+   610→                self.ctx,
+   611→                i_size,
+   612→                vk::BufferUsageFlags::INDEX_BUFFER,
+   613→                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+   614→            )?;
+   615→            buf.write_bytes(&index_bytes)?;
+   616→            buf
+   617→        } else {
+   618→            // No indices — allocate a 16-byte placeholder so the buffer
+   619→            // is valid even if the caller never binds it.
+   620→            Buffer::new(
+   621→                self.ctx,
+   622→                16,
+   623→                vk::BufferUsageFlags::INDEX_BUFFER,
+   624→                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+   625→            )?
+   626→        };
+   627→
+   628→        let _ = index_type;
+   629→        Ok(Mesh {
+   630→            vertex,
+   631→            index,
+   632→            index_count,
+   633→        })
+   634→    }
+   635→}
+   636→
+   637→/// A unit cube centered at the origin, with extents +/- 1 on each axis.
+   638→/// Each face has a distinct per-vertex color (R/G/B/Cyan/Magenta/Yellow)
+   639→/// so the cube is easy to visually inspect without textures or lighting.
+   640→///
+   641→/// Vertex layout per face: 4 vertices (bottom-left, bottom-right, top-right,
+   642→/// top-left), wound CCW when viewed from outside the cube. Face order:
+   643→///   0: +X (right)  — yellow
+   644→///   1: -X (left)   — cyan
+   645→///   2: +Y (bottom in Vulkan NDC, since Y points down) — magenta
+   646→///   3: -Y (top)    — red
+   647→///   4: +Z (front)  — green
+   648→///   5: -Z (back)   — blue
+   649→///
+   650→/// With BACK-face culling + CCW front-face winding, only the outward-
+   651→/// facing side of each face is rasterized, so the cube looks correct
+   652→/// from any viewing angle.
+   653→pub struct CubeMesh {
+   654→    pub mesh: Mesh,
+   655→}
+   656→
+   657→impl CubeMesh {
+   658→    pub fn new(ctx: &VkContext) -> RenderResult<Self> {
+   659→        // 24 vertices (4 per face x 6 faces) so each face has its own
+   660→        // vertex colors and normals (no shared corners). Indexed by 36
+   661→        // uint16s (2 triangles per face x 3 indices x 6 faces).
+   662→        let s = 1.0f32;
+   663→        let (rx, gx, bx) = (1.0f32, 0.0f32, 0.0f32); // not used
+   664→        let _ = (rx, gx, bx);
+   665→
+   666→        // Per-face colors (sRGB-ish primaries for visual debugging):
+   667→        let c_right  = [1.0, 1.0, 0.0]; // +X = yellow
+   668→        let c_left   = [0.0, 1.0, 1.0]; // -X = cyan
+   669→        let c_bottom = [1.0, 0.0, 1.0]; // +Y = magenta (Vulkan Y down → bottom)
+   670→        let c_top    = [1.0, 0.0, 0.0]; // -Y = red
+   671→        let c_front  = [0.0, 1.0, 0.0]; // +Z = green
+   672→        let c_back   = [0.0, 0.0, 1.0]; // -Z = blue
+   673→
+   674→        // Vertex winding: each face is 4 verts in BL, BR, TR, TL order
+   675→        // (CCW when viewed from outside). The two triangles per face are
+   676→        // (BL, BR, TR) and (BL, TR, TL).
+   677→        let mut verts: Vec<Vertex> = Vec::with_capacity(24);
+   678→
+   679→        // +X face (right)
+   680→        verts.push(Vertex { pos: [ s, -s, -s], color: c_right  });
+   681→        verts.push(Vertex { pos: [ s, -s,  s], color: c_right  });
+   682→        verts.push(Vertex { pos: [ s,  s,  s], color: c_right  });
+   683→        verts.push(Vertex { pos: [ s,  s, -s], color: c_right  });
+   684→        // -X face (left)
+   685→        verts.push(Vertex { pos: [-s, -s,  s], color: c_left   });
+   686→        verts.push(Vertex { pos: [-s, -s, -s], color: c_left   });
+   687→        verts.push(Vertex { pos: [-s,  s, -s], color: c_left   });
+   688→        verts.push(Vertex { pos: [-s,  s,  s], color: c_left   });
+   689→        // +Y face (bottom in Vulkan NDC)
+   690→        verts.push(Vertex { pos: [-s,  s,  s], color: c_bottom });
+   691→        verts.push(Vertex { pos: [-s,  s, -s], color: c_bottom });
+   692→        verts.push(Vertex { pos: [ s,  s, -s], color: c_bottom });
+   693→        verts.push(Vertex { pos: [ s,  s,  s], color: c_bottom });
+   694→        // -Y face (top in Vulkan NDC)
+   695→        verts.push(Vertex { pos: [-s, -s, -s], color: c_top    });
+   696→        verts.push(Vertex { pos: [-s, -s,  s], color: c_top    });
+   697→        verts.push(Vertex { pos: [ s, -s,  s], color: c_top    });
+   698→        verts.push(Vertex { pos: [ s, -s, -s], color: c_top    });
+   699→        // +Z face (front)
+   700→        verts.push(Vertex { pos: [ s, -s,  s], color: c_front  });
+   701→        verts.push(Vertex { pos: [-s, -s,  s], color: c_front  });
+   702→        verts.push(Vertex { pos: [-s,  s,  s], color: c_front  });
+   703→        verts.push(Vertex { pos: [ s,  s,  s], color: c_front  });
+   704→        // -Z face (back)
+   705→        verts.push(Vertex { pos: [-s, -s, -s], color: c_back   });
+   706→        verts.push(Vertex { pos: [ s, -s, -s], color: c_back   });
+   707→        verts.push(Vertex { pos: [ s,  s, -s], color: c_back   });
+   708→        verts.push(Vertex { pos: [-s,  s, -s], color: c_back   });
+   709→
+   710→        // Per-face index pattern: 0,1,2,0,2,3 (relative to face base).
+   711→        let face_idx = [0u16, 1, 2, 0, 2, 3];
+   712→        let mut indices: Vec<u16> = Vec::with_capacity(36);
+   713→        for f in 0..6u16 {
+   714→            let base = f * 4;
+   715→            for &i in &face_idx {
+   716→                indices.push(base + i);
+   717→            }
+   718→        }
+   719→
+   720→        let mesh = MeshBuilder::new(ctx)
+   721→            .vertices(&verts)
+   722→            .indices_u16(&indices)
+   723→            .build()?;
+   724→        Ok(Self { mesh })
+   725→    }
+   726→
+   727→    pub fn destroy(&mut self, ctx: &VkContext) {
+   728→        self.mesh.destroy(ctx);
+   729→    }
+   730→}
+   731→
+   732→// =============================================================================
+   733→// Shaders (embedded SPIR-V)
+   734→// =============================================================================
+   735→
+   736→#[derive(rust_embed::RustEmbed)]
+   737→#[folder = "shaders/spirv"]
+   738→pub struct ShaderAssets;
+   739→
+   740→pub fn load_shader(ctx: &VkContext, name: &str) -> RenderResult<vk::ShaderModule> {
+   741→    let file = ShaderAssets::get(name).ok_or_else(|| {
+   742→        RenderError::Shader(format!("embedded shader not found: {}", name))
+   743→    })?;
+   744→    let data = Cow::clone(&file.data);
+   745→    let code_slice = data.as_ref();
+   746→    let code: &[u32] = unsafe {
+   747→        std::slice::from_raw_parts(
+   748→            code_slice.as_ptr() as *const u32,
+   749→            code_slice.len() / 4,
+   750→        )
+   751→    };
+   752→    let create = vk::ShaderModuleCreateInfo::default().code(code);
+   753→    unsafe {
+   754→        Ok(ctx.device.create_shader_module(&create, None)
+   755→            .map_err(|e| RenderError::Shader(format!("create_shader_module: {:?}", e)))?)
+   756→    }
+   757→}
+   758→
+   759→// =============================================================================
+   760→// Depth buffer
+   761→// =============================================================================
+   762→
+   763→pub struct DepthBuffer {
+   764→    pub image: vk::Image,
+   765→    pub memory: vk::DeviceMemory,
+   766→    pub view: vk::ImageView,
+   767→    pub format: vk::Format,
+   768→    pub extent: vk::Extent2D,
+   769→}
+   770→
+   771→impl DepthBuffer {
+   772→    pub fn new(ctx: &VkContext, extent: vk::Extent2D) -> RenderResult<Self> {
+   773→        let format = pick_depth_format(ctx);
+   774→        log::info!(
+   775→            "depth buffer: {:?} {}x{}",
+   776→            format, extent.width, extent.height
+   777→        );
+   778→
+   779→        let create_info = vk::ImageCreateInfo::default()
+   780→            .image_type(vk::ImageType::TYPE_2D)
+   781→            .extent(vk::Extent3D {
+   782→                width: extent.width,
+   783→                height: extent.height,
+   784→                depth: 1,
+   785→            })
+   786→            .mip_levels(1)
+   787→            .array_layers(1)
+   788→            .format(format)
+   789→            .tiling(vk::ImageTiling::OPTIMAL)
+   790→            .initial_layout(vk::ImageLayout::UNDEFINED)
+   791→            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+   792→            .samples(vk::SampleCountFlags::TYPE_1)
+   793→            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+   794→        let image = unsafe {
+   795→            ctx.device.create_image(&create_info, None)
+   796→                .map_err(|e| RenderError::Allocator(format!("create_image (depth): {:?}", e)))?
+   797→        };
+   798→
+   799→        let req = unsafe { ctx.device.get_image_memory_requirements(image) };
+   800→        // DEVICE_LOCAL is preferred; on lavapipe this is just host memory

@@ -1,0 +1,1974 @@
+     1→//! arcane_render — the Arcane engine's real Vulkan renderer.
+     2→//!
+     3→//! Consolidated into a single file so the ash 0.38 API surface can be
+     4→//! audited at a glance and the Vulkan object lifecycle is obvious.
+     5→//!
+     6→//! ## Object lifecycle
+     7→//!
+     8→//! Drop order is reverse-construction order:
+     9→//!   1. readback buffer + command buffer
+    10→//!   2. triangle vertex/index buffers
+    11→//!   3. graphics pipeline + shader modules + pipeline layout
+    12→//!   4. framebuffers
+    13→//!   5. render pass
+    14→//!   6. frame (command buffers + sync objects)
+    15→//!   7. swapchain + image views + surface
+    16→//!   8. logical device
+    17→//!   9. debug messenger
+    18→//!  10. instance
+    19→//!
+    20→//! All Vulkan handles are stored as `vk::X` raw handles (not owning wrappers),
+    21→//! because the parent `VkContext` is kept alive in an `Arc` until the very end.
+    22→//! This is the simplest way to keep the Drop sequence right without fighting
+    23→//! the borrow checker for cross-references between wrappers.
+    24→
+    25→use std::borrow::Cow;
+    26→use std::ffi::{CStr, CString};
+    27→use std::sync::Arc;
+    28→
+    29→use ash::ext::{debug_utils, headless_surface};
+    30→use ash::vk;
+    31→use parking_lot::Mutex;
+    32→use tiny_http::{Header, Response, Server};
+    33→
+    34→// =============================================================================
+    35→// Error type
+    36→// =============================================================================
+    37→
+    38→#[derive(Debug)]
+    39→pub enum RenderError {
+    40→    LoaderNotFound(String),
+    41→    InstanceCreate(String),
+    42→    NoPhysicalDevice,
+    43→    DeviceCreate(String),
+    44→    QueueFamily(String),
+    45→    SurfaceCreate(String),
+    46→    SwapchainCreate(String),
+    47→    AcquireImage(String),
+    48→    Submit(String),
+    49→    Present(String),
+    50→    Shader(String),
+    51→    Pipeline(String),
+    52→    Allocator(String),
+    53→    Validation(String),
+    54→    IncompatibleDriver(String),
+    55→    Other(String),
+    56→}
+    57→
+    58→impl std::fmt::Display for RenderError {
+    59→    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    60→        write!(f, "{:?}", self)
+    61→    }
+    62→}
+    63→
+    64→impl std::error::Error for RenderError {}
+    65→
+    66→impl From<vk::Result> for RenderError {
+    67→    fn from(r: vk::Result) -> Self {
+    68→        match r {
+    69→            vk::Result::ERROR_INCOMPATIBLE_DRIVER => RenderError::IncompatibleDriver(format!("{:?}", r)),
+    70→            vk::Result::ERROR_INITIALIZATION_FAILED => RenderError::InstanceCreate(format!("{:?}", r)),
+    71→            vk::Result::ERROR_DEVICE_LOST => RenderError::DeviceCreate(format!("{:?}", r)),
+    72→            vk::Result::ERROR_OUT_OF_DATE_KHR => RenderError::SwapchainCreate(format!("{:?}", r)),
+    73→            _ => RenderError::Other(format!("vk::Result {:?}", r)),
+    74→        }
+    75→    }
+    76→}
+    77→
+    78→pub type RenderResult<T> = Result<T, RenderError>;
+    79→
+    80→// =============================================================================
+    81→// Vulkan context: entry, instance, debug messenger, physical device, device
+    82→// =============================================================================
+    83→
+    84→pub struct VkContext {
+    85→    pub entry: Arc<ash::Entry>,
+    86→    pub instance: ash::Instance,
+    87→    pub debug_utils_loader: Option<debug_utils::Instance>,
+    88→    pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
+    89→    pub physical_device: vk::PhysicalDevice,
+    90→    pub physical_device_props: vk::PhysicalDeviceProperties,
+    91→    pub physical_device_features: vk::PhysicalDeviceFeatures,
+    92→    pub device_memory_props: vk::PhysicalDeviceMemoryProperties,
+    93→    pub device: ash::Device,
+    94→    pub graphics_queue_family: u32,
+    95→    pub graphics_queue: vk::Queue,
+    96→    pub surface_loader: Option<ash::khr::surface::Instance>,
+    97→}
+    98→
+    99→static VALIDATION_FAILED: std::sync::atomic::AtomicBool =
+   100→    std::sync::atomic::AtomicBool::new(false);
+   101→
+   102→pub fn validation_failed() -> bool {
+   103→    VALIDATION_FAILED.load(std::sync::atomic::Ordering::SeqCst)
+   104→}
+   105→
+   106→unsafe extern "system" fn messenger_callback(
+   107→    flags: vk::DebugUtilsMessageSeverityFlagsEXT,
+   108→    _types: vk::DebugUtilsMessageTypeFlagsEXT,
+   109→    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+   110→    _user_data: *mut std::ffi::c_void,
+   111→) -> vk::Bool32 {
+   112→    // The pfn_user_callback expects Option<PFN_vkDebugUtilsMessengerCallbackEXT>.
+   113→    // PFN's signature is exactly the same as ours. The Some(...) wrapping is
+   114→    // done by the caller, not here.
+   115→    let data = &*p_callback_data;
+   116→    let message = if data.p_message.is_null() {
+   117→        "(no message)".to_string()
+   118→    } else {
+   119→        CStr::from_ptr(data.p_message).to_string_lossy().to_string()
+   120→    };
+   121→
+   122→    let prefix = if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+   123→        "[VK error]"
+   124→    } else if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+   125→        "[VK warn]"
+   126→    } else if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
+   127→        "[VK info]"
+   128→    } else {
+   129→        "[VK verbose]"
+   130→    };
+   131→
+   132→    let full = format!("{} {}", prefix, message);
+   133→
+   134→    if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+   135→        log::error!("{}", full);
+   136→        VALIDATION_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+   137→    } else if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+   138→        log::warn!("{}", full);
+   139→    } else if flags.contains(vk::DebugUtilsMessageSeverityFlagsEXT::INFO) {
+   140→        log::info!("{}", full);
+   141→    } else {
+   142→        log::debug!("{}", full);
+   143→    }
+   144→
+   145→    vk::FALSE
+   146→}
+   147→
+   148→impl VkContext {
+   149→    pub fn new(app_name: &str, use_validation: bool) -> RenderResult<Arc<Self>> {
+   150→        let entry = unsafe { ash::Entry::load() }
+   151→            .map_err(|e| RenderError::LoaderNotFound(e.to_string()))?;
+   152→        let entry = Arc::new(entry);
+   153→
+   154→        // enumerate available instance layers
+   155→        let available_layers = unsafe {
+   156→            entry.enumerate_instance_layer_properties()
+   157→                .unwrap_or_else(|e| {
+   158→                    log::warn!("enumerate_instance_layer_properties failed: {:?}", e);
+   159→                    Vec::new()
+   160→                })
+   161→        };
+   162→        let want_validation = use_validation && available_layers.iter().any(|l| {
+   163→            unsafe { CStr::from_ptr(l.layer_name.as_ptr()).to_string_lossy().starts_with("VK_LAYER_KHRONOS") }
+   164→        });
+   165→        if use_validation && !want_validation {
+   166→            log::warn!("VK_LAYER_KHRONOS_validation not available — running without validation");
+   167→        }
+   168→
+   169→        let mut layer_names: Vec<CString> = Vec::new();
+   170→        if want_validation {
+   171→            layer_names.push(CString::new("VK_LAYER_KHRONOS_validation").unwrap());
+   172→        }
+   173→        let layers_ptrs: Vec<*const i8> = layer_names.iter().map(|n| n.as_ptr()).collect();
+   174→
+   175→        // extensions: debug_utils + headless_surface + KHR_surface
+   176→        let mut extension_names: Vec<CString> = Vec::new();
+   177→        extension_names.push(CString::new("VK_EXT_debug_utils").unwrap());
+   178→        extension_names.push(CString::new("VK_EXT_headless_surface").unwrap());
+   179→        extension_names.push(CString::new("VK_KHR_surface").unwrap());
+   180→
+   181→        let available_exts = unsafe {
+   182→            entry.enumerate_instance_extension_properties(None)
+   183→                .unwrap_or_else(|e| {
+   184→                    log::warn!("enumerate_instance_extension_properties failed: {:?}", e);
+   185→                    Vec::new()
+   186→                })
+   187→        };
+   188→        for ext in &extension_names {
+   189→            let present = available_exts.iter().any(|a| {
+   190→                let name = unsafe { CStr::from_ptr(a.extension_name.as_ptr()).to_string_lossy() };
+   191→                name == ext.to_string_lossy()
+   192→            });
+   193→            if !present {
+   194→                return Err(RenderError::InstanceCreate(format!(
+   195→                    "Required instance extension not available: {}", ext.to_string_lossy()
+   196→                )));
+   197→            }
+   198→        }
+   199→        let ext_ptrs: Vec<*const i8> = extension_names.iter().map(|n| n.as_ptr()).collect();
+   200→
+   201→        let app_name_c = CString::new(app_name).unwrap();
+   202→        let engine_name_c = CString::new("Arcane").unwrap();
+   203→        let app_info = vk::ApplicationInfo::default()
+   204→            .application_name(&app_name_c)
+   205→            .application_version(vk::make_api_version(0, 0, 1, 0))
+   206→            .engine_name(&engine_name_c)
+   207→            .engine_version(vk::make_api_version(0, 0, 1, 0))
+   208→            .api_version(vk::API_VERSION_1_3);
+   209→
+   210→        let create_info = vk::InstanceCreateInfo::default()
+   211→            .application_info(&app_info)
+   212→            .enabled_layer_names(&layers_ptrs)
+   213→            .enabled_extension_names(&ext_ptrs);
+   214→
+   215→        let mut debug_create = vk::DebugUtilsMessengerCreateInfoEXT::default()
+   216→            .flags(vk::DebugUtilsMessengerCreateFlagsEXT::empty())
+   217→            .message_severity(
+   218→                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+   219→                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+   220→                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
+   221→            )
+   222→            .message_type(
+   223→                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+   224→                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+   225→                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+   226→            )
+   227→            .pfn_user_callback(Some(messenger_callback));
+   228→            // Some(fn_item) coerces to Option<PFN_...>. If the types differ in
+   229→            // mutability, we use as `unsafe extern "system" fn(...)` directly.
+   230→        let _ = create_info.push_next(&mut debug_create);
+   231→
+   232→        let instance = unsafe {
+   233→            entry.create_instance(&create_info, None)
+   234→                .map_err(|e| {
+   235→                    log::error!("vkCreateInstance failed: {:?}", e);
+   236→                    RenderError::InstanceCreate(format!("{:?}", e))
+   237→                })?
+   238→        };
+   239→
+   240→        let (debug_utils_loader, debug_messenger) = if want_validation {
+   241→            let loader = debug_utils::Instance::new(&entry, &instance);
+   242→            let messenger = unsafe {
+   243→                loader.create_debug_utils_messenger(&debug_create, None)
+   244→                    .map_err(|e| RenderError::Validation(format!(
+   245→                        "create_debug_utils_messenger: {:?}", e
+   246→                    )))?
+   247→            };
+   248→            (Some(loader), Some(messenger))
+   249→        } else {
+   250→            (None, None)
+   251→        };
+   252→
+   253→        // physical device selection
+   254→        let physicals = unsafe {
+   255→            instance.enumerate_physical_devices()
+   256→                .map_err(|e| RenderError::Other(format!("enumerate_physical_devices: {:?}", e)))?
+   257→        };
+   258→        if physicals.is_empty() {
+   259→            return Err(RenderError::NoPhysicalDevice);
+   260→        }
+   261→
+   262→        let mut best: Option<(vk::PhysicalDevice, vk::PhysicalDeviceProperties, vk::PhysicalDeviceFeatures, vk::PhysicalDeviceMemoryProperties, u32, u64)> = None;
+   263→        for pd in physicals {
+   264→            let props = unsafe { instance.get_physical_device_properties(pd) };
+   265→            let features = unsafe { instance.get_physical_device_features(pd) };
+   266→            let mem_props = unsafe { instance.get_physical_device_memory_properties(pd) };
+   267→            let qfams = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+   268→
+   269→            let mut graphics_fam = None;
+   270→            for (i, q) in qfams.iter().enumerate() {
+   271→                if q.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+   272→                    graphics_fam = Some(i as u32);
+   273→                    break;
+   274→                }
+   275→            }
+   276→            let graphics_qf = match graphics_fam {
+   277→                Some(g) => g,
+   278→                None => continue,
+   279→            };
+   280→
+   281→            let total_local = (0..mem_props.memory_heap_count as usize)
+   282→                .filter(|i| mem_props.memory_heaps[*i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+   283→                .map(|i| mem_props.memory_heaps[i].size)
+   284→                .sum::<u64>();
+   285→
+   286→            log::info!(
+   287→                "physical device: {:?} type={:?} device_local_memory={} MiB graphics_queue={}",
+   288→                unsafe { CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy() },
+   289→                props.device_type,
+   290→                total_local / (1024 * 1024),
+   291→                graphics_qf
+   292→            );
+   293→
+   294→            let is_better = match &best {
+   295→                None => true,
+   296→                Some((.., b_total)) => total_local > *b_total,
+   297→            };
+   298→            if is_better {
+   299→                best = Some((pd, props, features, mem_props, graphics_qf, total_local));
+   300→            }
+   301→        }
+   302→
+   303→        let (physical_device, physical_device_props, physical_device_features, device_memory_props, graphics_qf, _)
+   304→            = best.ok_or(RenderError::NoPhysicalDevice)?;
+   305→
+   306→        if physical_device_features.geometry_shader == vk::FALSE {
+   307→            log::warn!("Selected physical device has no geometry shader");
+   308→        }
+   309→
+   310→        // logical device
+   311→        let queue_priorities = [1.0f32];
+   312→        let graphics_create = vk::DeviceQueueCreateInfo::default()
+   313→            .queue_family_index(graphics_qf)
+   314→            .queue_priorities(&queue_priorities);
+   315→
+   316→        let mut desired_features = vk::PhysicalDeviceFeatures::default();
+   317→        desired_features.geometry_shader = physical_device_features.geometry_shader;
+   318→        desired_features.fill_mode_non_solid = physical_device_features.fill_mode_non_solid;
+   319→        desired_features.shader_clip_distance = physical_device_features.shader_clip_distance;
+   320→        desired_features.wide_lines = physical_device_features.wide_lines;
+   321→        desired_features.depth_clamp = physical_device_features.depth_clamp;
+   322→        desired_features.sampler_anisotropy = physical_device_features.sampler_anisotropy;
+   323→
+   324→        // VK_KHR_swapchain is required to create a swapchain (even on a
+   325→        // headless surface — it is the only present path).
+   326→        // On Vulkan 1.1+ it may be promoted but it's still a device extension.
+   327→        let swap_ext = CString::new("VK_KHR_swapchain").unwrap();
+   328→        let device_extensions: [*const i8; 1] = [swap_ext.as_ptr()];
+   329→        let device_create_info = vk::DeviceCreateInfo::default()
+   330→            .queue_create_infos(std::slice::from_ref(&graphics_create))
+   331→            .enabled_extension_names(&device_extensions)
+   332→            .enabled_features(&desired_features);
+   333→
+   334→        let device = unsafe {
+   335→            instance.create_device(physical_device, &device_create_info, None)
+   336→                .map_err(|e| {
+   337→                    log::error!("vkCreateDevice failed: {:?}", e);
+   338→                    RenderError::DeviceCreate(format!("{:?}", e))
+   339→                })?
+   340→        };
+   341→
+   342→        let graphics_queue = unsafe { device.get_device_queue(graphics_qf, 0) };
+   343→
+   344→        log::info!(
+   345→            "Vulkan context ready: device={:?}",
+   346→            unsafe { CStr::from_ptr(physical_device_props.device_name.as_ptr()).to_string_lossy() }
+   347→        );
+   348→
+   349→        Ok(Arc::new(Self {
+   350→            entry,
+   351→            instance,
+   352→            debug_utils_loader,
+   353→            debug_messenger,
+   354→            physical_device,
+   355→            physical_device_props,
+   356→            physical_device_features,
+   357→            device_memory_props,
+   358→            device,
+   359→            graphics_queue_family: graphics_qf,
+   360→            graphics_queue,
+   361→            surface_loader: None,
+   362→        }))
+   363→    }
+   364→
+   365→    pub fn device_name(&self) -> String {
+   366→        unsafe { CStr::from_ptr(self.physical_device_props.device_name.as_ptr()) }
+   367→            .to_string_lossy().to_string()
+   368→    }
+   369→
+   370→    pub fn find_memory_type(
+   371→        &self,
+   372→        type_bits: u32,
+   373→        properties: vk::MemoryPropertyFlags,
+   374→    ) -> RenderResult<u32> {
+   375→        for i in 0..self.device_memory_props.memory_type_count {
+   376→            let bit = (type_bits >> i) & 1;
+   377→            if bit == 1 {
+   378→                let flags = self.device_memory_props.memory_types[i as usize].property_flags;
+   379→                if flags.contains(properties) {
+   380→                    return Ok(i);
+   381→                }
+   382→            }
+   383→        }
+   384→        Err(RenderError::Allocator(format!(
+   385→            "No memory type matching type_bits={:#x} properties={:?}",
+   386→            type_bits, properties
+   387→        )))
+   388→    }
+   389→}
+   390→
+   391→impl Drop for VkContext {
+   392→    fn drop(&mut self) {
+   393→        unsafe {
+   394→            if let (Some(loader), Some(messenger)) =
+   395→                (self.debug_utils_loader.as_ref(), self.debug_messenger.take())
+   396→            {
+   397→                let _ = loader.destroy_debug_utils_messenger(messenger, None);
+   398→            }
+   399→            self.device.destroy_device(None);
+   400→            self.instance.destroy_instance(None);
+   401→        }
+   402→    }
+   403→}
+   404→
+   405→// =============================================================================
+   406→// Buffer
+   407→// =============================================================================
+   408→
+   409→pub struct Buffer {
+   410→    pub raw: vk::Buffer,
+   411→    pub memory: vk::DeviceMemory,
+   412→    pub size: vk::DeviceSize,
+   413→    pub mapped: Option<*mut std::ffi::c_void>,
+   414→    pub memory_props: vk::MemoryPropertyFlags,
+   415→}
+   416→
+   417→impl Buffer {
+   418→    pub fn new(
+   419→        ctx: &VkContext,
+   420→        size: vk::DeviceSize,
+   421→        usage: vk::BufferUsageFlags,
+   422→        properties: vk::MemoryPropertyFlags,
+   423→    ) -> RenderResult<Self> {
+   424→        let create = vk::BufferCreateInfo::default()
+   425→            .size(size)
+   426→            .usage(usage)
+   427→            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+   428→        let raw = unsafe {
+   429→            ctx.device.create_buffer(&create, None)
+   430→                .map_err(|e| RenderError::Allocator(format!("create_buffer: {:?}", e)))?
+   431→        };
+   432→        let req = unsafe { ctx.device.get_buffer_memory_requirements(raw) };
+   433→        let mem_type = ctx.find_memory_type(req.memory_type_bits, properties)?;
+   434→        let alloc = vk::MemoryAllocateInfo::default()
+   435→            .allocation_size(req.size)
+   436→            .memory_type_index(mem_type);
+   437→        let memory = unsafe {
+   438→            ctx.device.allocate_memory(&alloc, None)
+   439→                .map_err(|e| RenderError::Allocator(format!("allocate_memory: {:?}", e)))?
+   440→        };
+   441→        unsafe {
+   442→            ctx.device.bind_buffer_memory(raw, memory, 0)
+   443→                .map_err(|e| RenderError::Allocator(format!("bind_buffer_memory: {:?}", e)))?;
+   444→        }
+   445→        let mapped = if properties.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
+   446→            let ptr = unsafe {
+   447→                ctx.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+   448→                    .map_err(|e| RenderError::Allocator(format!("map_memory: {:?}", e)))?
+   449→            };
+   450→            Some(ptr)
+   451→        } else {
+   452→            None
+   453→        };
+   454→        Ok(Self { raw, memory, size, mapped, memory_props: properties })
+   455→    }
+   456→
+   457→    pub fn write_bytes(&mut self, bytes: &[u8]) -> RenderResult<()> {
+   458→        let p = self.mapped.ok_or_else(|| RenderError::Allocator("buffer not mapped".into()))?;
+   459→        unsafe {
+   460→            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+   461→        }
+   462→        Ok(())
+   463→    }
+   464→
+   465→    pub fn read_bytes(&self) -> &[u8] {
+   466→        match self.mapped {
+   467→            Some(p) => unsafe { std::slice::from_raw_parts(p as *const u8, self.size as usize) },
+   468→            None => &[],
+   469→        }
+   470→    }
+   471→
+   472→    pub fn destroy(&mut self, ctx: &VkContext) {
+   473→        if self.mapped.is_some() {
+   474→            unsafe { ctx.device.unmap_memory(self.memory); }
+   475→            self.mapped = None;
+   476→        }
+   477→        unsafe {
+   478→            ctx.device.destroy_buffer(self.raw, None);
+   479→            ctx.device.free_memory(self.memory, None);
+   480→        }
+   481→    }
+   482→}
+   483→
+   484→// =============================================================================
+   485→// Vertex / Mesh
+   486→// =============================================================================
+   487→
+   488→#[repr(C)]
+   489→#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+   490→pub struct Vertex {
+   491→    pub pos: [f32; 3],
+   492→    pub color: [f32; 3],
+   493→}
+   494→
+   495→pub struct TriangleMesh {
+   496→    pub vertex: Buffer,
+   497→    pub index: Buffer,
+   498→    pub index_count: u32,
+   499→}
+   500→
+   501→impl TriangleMesh {
+   502→    pub fn new(ctx: &VkContext) -> RenderResult<Self> {
+   503→        let vertices: [Vertex; 3] = [
+   504→            Vertex { pos: [ 0.5, -0.5, 0.0], color: [1.0, 0.0, 0.0] },
+   505→            Vertex { pos: [-0.5, -0.5, 0.0], color: [0.0, 1.0, 0.0] },
+   506→            Vertex { pos: [ 0.0,  0.5, 0.0], color: [0.0, 0.0, 1.0] },
+   507→        ];
+   508→        let indices: [u16; 3] = [0, 1, 2];
+   509→        MeshBuilder::new(ctx)
+   510→            .vertices(&vertices)
+   511→            .indices_u16(&indices)
+   512→            .build()
+   513→            .map(|m| TriangleMesh { vertex: m.vertex, index: m.index, index_count: m.index_count })
+   514→    }
+   515→
+   516→    pub fn destroy(&mut self, ctx: &VkContext) {
+   517→        self.vertex.destroy(ctx);
+   518→        self.index.destroy(ctx);
+   519→    }
+   520→}
+   521→
+   522→/// Generic mesh: vertex + index buffers + index count. Constructed by
+   523→/// [`MeshBuilder`] from arbitrary vertex/index data. The caller owns the
+   524→/// mesh and is responsible for calling [`Mesh::destroy`] before the
+   525→/// underlying `VkContext` is dropped.
+   526→pub struct Mesh {
+   527→    pub vertex: Buffer,
+   528→    pub index: Buffer,
+   529→    pub index_count: u32,
+   530→}
+   531→
+   532→impl Mesh {
+   533→    pub fn destroy(&mut self, ctx: &VkContext) {
+   534→        self.vertex.destroy(ctx);
+   535→        self.index.destroy(ctx);
+   536→    }
+   537→}
+   538→
+   539→/// Builder for [`Mesh`]. Streams vertex + index data into HOST_VISIBLE
+   540→/// HOST_COHERENT buffers (lavapipe is CPU-backed so this is fine; on a
+   541→/// real GPU we'd stage through a transfer queue and a DEVICE_LOCAL buffer).
+   542→pub struct MeshBuilder<'a> {
+   543→    ctx: &'a VkContext,
+   544→    vertices_bytes: Vec<u8>,
+   545→    indices_u16: Vec<u16>,
+   546→    indices_u32: Vec<u32>,
+   547→    index_type: vk::IndexType,
+   548→}
+   549→
+   550→impl<'a> MeshBuilder<'a> {
+   551→    pub fn new(ctx: &'a VkContext) -> Self {
+   552→        Self {
+   553→            ctx,
+   554→            vertices_bytes: Vec::new(),
+   555→            indices_u16: Vec::new(),
+   556→            indices_u32: Vec::new(),
+   557→            index_type: vk::IndexType::UINT16,
+   558→        }
+   559→    }
+   560→
+   561→    /// Append a slice of vertices (any `#[repr(C)]` struct). The bytes are
+   562→    /// copied as-is; the caller is responsible for matching the vertex
+   563→    /// input binding description's stride and attribute offsets to the
+   564→    /// struct's layout.
+   565→    pub fn vertices<V: bytemuck::Pod>(mut self, vs: &[V]) -> Self {
+   566→        let bytes: &[u8] = bytemuck::cast_slice(vs);
+   567→        self.vertices_bytes.extend_from_slice(bytes);
+   568→        self
+   569→    }
+   570→
+   571→    pub fn indices_u16(mut self, idx: &[u16]) -> Self {
+   572→        self.indices_u16.extend_from_slice(idx);
+   573→        self.index_type = vk::IndexType::UINT16;
+   574→        self
+   575→    }
+   576→
+   577→    pub fn indices_u32(mut self, idx: &[u32]) -> Self {
+   578→        self.indices_u32.extend_from_slice(idx);
+   579→        self.index_type = vk::IndexType::UINT32;
+   580→        self
+   581→    }
+   582→
+   583→    pub fn build(self) -> RenderResult<Mesh> {
+   584→        let v_size = self.vertices_bytes.len() as vk::DeviceSize;
+   585→        if v_size == 0 {
+   586→            return Err(RenderError::Allocator("mesh has no vertices".into()));
+   587→        }
+   588→
+   589→        let (index_bytes, index_count, index_type) = if !self.indices_u16.is_empty() {
+   590→            let bytes: &[u8] = bytemuck::cast_slice(&self.indices_u16);
+   591→            (bytes.to_vec(), self.indices_u16.len() as u32, vk::IndexType::UINT16)
+   592→        } else if !self.indices_u32.is_empty() {
+   593→            let bytes: &[u8] = bytemuck::cast_slice(&self.indices_u32);
+   594→            (bytes.to_vec(), self.indices_u32.len() as u32, vk::IndexType::UINT32)
+   595→        } else {
+   596→            (Vec::new(), 0, vk::IndexType::NONE_NV)
+   597→        };
+   598→
+   599→        let mut vertex = Buffer::new(
+   600→            self.ctx,
+   601→            v_size.max(16),
+   602→            vk::BufferUsageFlags::VERTEX_BUFFER,
+   603→            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+   604→        )?;
+   605→        vertex.write_bytes(&self.vertices_bytes)?;
+   606→
+   607→        let index = if !index_bytes.is_empty() {
+   608→            let i_size = index_bytes.len() as vk::DeviceSize;
+   609→            let mut buf = Buffer::new(
+   610→                self.ctx,
+   611→                i_size,
+   612→                vk::BufferUsageFlags::INDEX_BUFFER,
+   613→                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+   614→            )?;
+   615→            buf.write_bytes(&index_bytes)?;
+   616→            buf
+   617→        } else {
+   618→            // No indices — allocate a 16-byte placeholder so the buffer
+   619→            // is valid even if the caller never binds it.
+   620→            Buffer::new(
+   621→                self.ctx,
+   622→                16,
+   623→                vk::BufferUsageFlags::INDEX_BUFFER,
+   624→                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+   625→            )?
+   626→        };
+   627→
+   628→        let _ = index_type;
+   629→        Ok(Mesh {
+   630→            vertex,
+   631→            index,
+   632→            index_count,
+   633→        })
+   634→    }
+   635→}
+   636→
+   637→/// A unit cube centered at the origin, with extents +/- 1 on each axis.
+   638→/// Each face has a distinct per-vertex color (R/G/B/Cyan/Magenta/Yellow)
+   639→/// so the cube is easy to visually inspect without textures or lighting.
+   640→///
+   641→/// Vertex layout per face: 4 vertices (bottom-left, bottom-right, top-right,
+   642→/// top-left), wound CCW when viewed from outside the cube. Face order:
+   643→///   0: +X (right)  — yellow
+   644→///   1: -X (left)   — cyan
+   645→///   2: +Y (bottom in Vulkan NDC, since Y points down) — magenta
+   646→///   3: -Y (top)    — red
+   647→///   4: +Z (front)  — green
+   648→///   5: -Z (back)   — blue
+   649→///
+   650→/// With BACK-face culling + CCW front-face winding, only the outward-
+   651→/// facing side of each face is rasterized, so the cube looks correct
+   652→/// from any viewing angle.
+   653→pub struct CubeMesh {
+   654→    pub mesh: Mesh,
+   655→}
+   656→
+   657→impl CubeMesh {
+   658→    pub fn new(ctx: &VkContext) -> RenderResult<Self> {
+   659→        // 24 vertices (4 per face x 6 faces) so each face has its own
+   660→        // vertex colors and normals (no shared corners). Indexed by 36
+   661→        // uint16s (2 triangles per face x 3 indices x 6 faces).
+   662→        let s = 1.0f32;
+   663→        let (rx, gx, bx) = (1.0f32, 0.0f32, 0.0f32); // not used
+   664→        let _ = (rx, gx, bx);
+   665→
+   666→        // Per-face colors (sRGB-ish primaries for visual debugging):
+   667→        let c_right  = [1.0, 1.0, 0.0]; // +X = yellow
+   668→        let c_left   = [0.0, 1.0, 1.0]; // -X = cyan
+   669→        let c_bottom = [1.0, 0.0, 1.0]; // +Y = magenta (Vulkan Y down → bottom)
+   670→        let c_top    = [1.0, 0.0, 0.0]; // -Y = red
+   671→        let c_front  = [0.0, 1.0, 0.0]; // +Z = green
+   672→        let c_back   = [0.0, 0.0, 1.0]; // -Z = blue
+   673→
+   674→        // Vertex winding: each face is 4 verts in BL, BR, TR, TL order
+   675→        // (CCW when viewed from outside). The two triangles per face are
+   676→        // (BL, BR, TR) and (BL, TR, TL).
+   677→        let mut verts: Vec<Vertex> = Vec::with_capacity(24);
+   678→
+   679→        // +X face (right)
+   680→        verts.push(Vertex { pos: [ s, -s, -s], color: c_right  });
+   681→        verts.push(Vertex { pos: [ s, -s,  s], color: c_right  });
+   682→        verts.push(Vertex { pos: [ s,  s,  s], color: c_right  });
+   683→        verts.push(Vertex { pos: [ s,  s, -s], color: c_right  });
+   684→        // -X face (left)
+   685→        verts.push(Vertex { pos: [-s, -s,  s], color: c_left   });
+   686→        verts.push(Vertex { pos: [-s, -s, -s], color: c_left   });
+   687→        verts.push(Vertex { pos: [-s,  s, -s], color: c_left   });
+   688→        verts.push(Vertex { pos: [-s,  s,  s], color: c_left   });
+   689→        // +Y face (bottom in Vulkan NDC)
+   690→        verts.push(Vertex { pos: [-s,  s,  s], color: c_bottom });
+   691→        verts.push(Vertex { pos: [-s,  s, -s], color: c_bottom });
+   692→        verts.push(Vertex { pos: [ s,  s, -s], color: c_bottom });
+   693→        verts.push(Vertex { pos: [ s,  s,  s], color: c_bottom });
+   694→        // -Y face (top in Vulkan NDC)
+   695→        verts.push(Vertex { pos: [-s, -s, -s], color: c_top    });
+   696→        verts.push(Vertex { pos: [-s, -s,  s], color: c_top    });
+   697→        verts.push(Vertex { pos: [ s, -s,  s], color: c_top    });
+   698→        verts.push(Vertex { pos: [ s, -s, -s], color: c_top    });
+   699→        // +Z face (front)
+   700→        verts.push(Vertex { pos: [ s, -s,  s], color: c_front  });
+   701→        verts.push(Vertex { pos: [-s, -s,  s], color: c_front  });
+   702→        verts.push(Vertex { pos: [-s,  s,  s], color: c_front  });
+   703→        verts.push(Vertex { pos: [ s,  s,  s], color: c_front  });
+   704→        // -Z face (back)
+   705→        verts.push(Vertex { pos: [-s, -s, -s], color: c_back   });
+   706→        verts.push(Vertex { pos: [ s, -s, -s], color: c_back   });
+   707→        verts.push(Vertex { pos: [ s,  s, -s], color: c_back   });
+   708→        verts.push(Vertex { pos: [-s,  s, -s], color: c_back   });
+   709→
+   710→        // Per-face index pattern: 0,1,2,0,2,3 (relative to face base).
+   711→        let face_idx = [0u16, 1, 2, 0, 2, 3];
+   712→        let mut indices: Vec<u16> = Vec::with_capacity(36);
+   713→        for f in 0..6u16 {
+   714→            let base = f * 4;
+   715→            for &i in &face_idx {
+   716→                indices.push(base + i);
+   717→            }
+   718→        }
+   719→
+   720→        let mesh = MeshBuilder::new(ctx)
+   721→            .vertices(&verts)
+   722→            .indices_u16(&indices)
+   723→            .build()?;
+   724→        Ok(Self { mesh })
+   725→    }
+   726→
+   727→    pub fn destroy(&mut self, ctx: &VkContext) {
+   728→        self.mesh.destroy(ctx);
+   729→    }
+   730→}
+   731→
+   732→// =============================================================================
+   733→// Shaders (embedded SPIR-V)
+   734→// =============================================================================
+   735→
+   736→#[derive(rust_embed::RustEmbed)]
+   737→#[folder = "shaders/spirv"]
+   738→pub struct ShaderAssets;
+   739→
+   740→pub fn load_shader(ctx: &VkContext, name: &str) -> RenderResult<vk::ShaderModule> {
+   741→    let file = ShaderAssets::get(name).ok_or_else(|| {
+   742→        RenderError::Shader(format!("embedded shader not found: {}", name))
+   743→    })?;
+   744→    let data = Cow::clone(&file.data);
+   745→    let code_slice = data.as_ref();
+   746→    let code: &[u32] = unsafe {
+   747→        std::slice::from_raw_parts(
+   748→            code_slice.as_ptr() as *const u32,
+   749→            code_slice.len() / 4,
+   750→        )
+   751→    };
+   752→    let create = vk::ShaderModuleCreateInfo::default().code(code);
+   753→    unsafe {
+   754→        Ok(ctx.device.create_shader_module(&create, None)
+   755→            .map_err(|e| RenderError::Shader(format!("create_shader_module: {:?}", e)))?)
+   756→    }
+   757→}
+   758→
+   759→// =============================================================================
+   760→// Depth buffer
+   761→// =============================================================================
+   762→
+   763→pub struct DepthBuffer {
+   764→    pub image: vk::Image,
+   765→    pub memory: vk::DeviceMemory,
+   766→    pub view: vk::ImageView,
+   767→    pub format: vk::Format,
+   768→    pub extent: vk::Extent2D,
+   769→}
+   770→
+   771→impl DepthBuffer {
+   772→    pub fn new(ctx: &VkContext, extent: vk::Extent2D) -> RenderResult<Self> {
+   773→        let format = pick_depth_format(ctx);
+   774→        log::info!(
+   775→            "depth buffer: {:?} {}x{}",
+   776→            format, extent.width, extent.height
+   777→        );
+   778→
+   779→        let create_info = vk::ImageCreateInfo::default()
+   780→            .image_type(vk::ImageType::TYPE_2D)
+   781→            .extent(vk::Extent3D {
+   782→                width: extent.width,
+   783→                height: extent.height,
+   784→                depth: 1,
+   785→            })
+   786→            .mip_levels(1)
+   787→            .array_layers(1)
+   788→            .format(format)
+   789→            .tiling(vk::ImageTiling::OPTIMAL)
+   790→            .initial_layout(vk::ImageLayout::UNDEFINED)
+   791→            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+   792→            .samples(vk::SampleCountFlags::TYPE_1)
+   793→            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+   794→        let image = unsafe {
+   795→            ctx.device.create_image(&create_info, None)
+   796→                .map_err(|e| RenderError::Allocator(format!("create_image (depth): {:?}", e)))?
+   797→        };
+   798→
+   799→        let req = unsafe { ctx.device.get_image_memory_requirements(image) };
+   800→        // DEVICE_LOCAL is preferred; on lavapipe this is just host memory
+   801→        // anyway but we keep the convention for when we run on a real GPU.
+   802→        let mem_type = ctx.find_memory_type(
+   803→            req.memory_type_bits,
+   804→            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+   805→        )?;
+   806→        let alloc = vk::MemoryAllocateInfo::default()
+   807→            .allocation_size(req.size)
+   808→            .memory_type_index(mem_type);
+   809→        let memory = unsafe {
+   810→            ctx.device.allocate_memory(&alloc, None)
+   811→                .map_err(|e| RenderError::Allocator(format!("allocate_memory (depth): {:?}", e)))?
+   812→        };
+   813→        unsafe {
+   814→            ctx.device.bind_image_memory(image, memory, 0)
+   815→                .map_err(|e| RenderError::Allocator(format!("bind_image_memory (depth): {:?}", e)))?;
+   816→        }
+   817→
+   818→        let view_create = vk::ImageViewCreateInfo::default()
+   819→            .image(image)
+   820→            .view_type(vk::ImageViewType::TYPE_2D)
+   821→            .format(format)
+   822→            .subresource_range(vk::ImageSubresourceRange {
+   823→                aspect_mask: vk::ImageAspectFlags::DEPTH,
+   824→                base_mip_level: 0,
+   825→                level_count: 1,
+   826→                base_array_layer: 0,
+   827→                layer_count: 1,
+   828→            });
+   829→        let view = unsafe {
+   830→            ctx.device.create_image_view(&view_create, None)
+   831→                .map_err(|e| RenderError::Allocator(format!("create_image_view (depth): {:?}", e)))?
+   832→        };
+   833→
+   834→        // No explicit layout transition here — the render pass's
+   835→        // `initial_layout = UNDEFINED` + `load_op = CLEAR` performs the
+   836→        // transition to DEPTH_STENCIL_ATTACHMENT_OPTIMAL on the first
+   837→        // render pass instance.
+   838→
+   839→        Ok(Self { image, memory, view, format, extent })
+   840→    }
+   841→
+   842→    pub fn destroy(&mut self, ctx: &VkContext) {
+   843→        unsafe {
+   844→            ctx.device.destroy_image_view(self.view, None);
+   845→            ctx.device.destroy_image(self.image, None);
+   846→            ctx.device.free_memory(self.memory, None);
+   847→        }
+   848→    }
+   849→}
+   850→
+   851→/// Pick a depth format that the physical device supports for optimal tiling
+   852→/// depth-stencil attachment usage. Prefer D32_SFLOAT (highest precision,
+   853→/// simplest), fall back to D24_UNORM_S8_UINT (24-bit depth + 8-bit stencil,
+   854→/// which is what most desktop GPUs natively expose).
+   855→pub fn pick_depth_format(ctx: &VkContext) -> vk::Format {
+   856→    let candidates = [
+   857→        vk::Format::D32_SFLOAT,
+   858→        vk::Format::D24_UNORM_S8_UINT,
+   859→        vk::Format::D16_UNORM,
+   860→    ];
+   861→    for &f in &candidates {
+   862→        let props = unsafe {
+   863→            ctx.instance.get_physical_device_format_properties(
+   864→                ctx.physical_device,
+   865→                f,
+   866→            )
+   867→        };
+   868→        if props.optimal_tiling_features
+   869→            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+   870→        {
+   871→            return f;
+   872→        }
+   873→    }
+   874→    // Last resort — let the validation layer complain rather than panic.
+   875→    vk::Format::D32_SFLOAT
+   876→}
+   877→
+   878→// =============================================================================
+   879→// Render pass + pipeline
+   880→// =============================================================================
+   881→
+   882→pub struct Pipeline {
+   883→    pub render_pass: vk::RenderPass,
+   884→    pub pipeline: vk::Pipeline,
+   885→    pub pipeline_layout: vk::PipelineLayout,
+   886→    pub vert_module: vk::ShaderModule,
+   887→    pub frag_module: vk::ShaderModule,
+   888→}
+   889→
+   890→impl Pipeline {
+   891→    pub fn new(ctx: &VkContext, color_format: vk::Format, depth_format: vk::Format, extent: vk::Extent2D) -> RenderResult<Self> {
+   892→        // Render pass: color attachment + depth attachment.
+   893→        // The depth attachment is cleared at the start of each render pass
+   894→        // and discarded at the end (we don't need to read it back; lavapipe
+   895→        // discards it as soon as the render pass ends).
+   896→        let color_attach = vk::AttachmentDescription::default()
+   897→            .format(color_format)
+   898→            .samples(vk::SampleCountFlags::TYPE_1)
+   899→            .load_op(vk::AttachmentLoadOp::CLEAR)
+   900→            .store_op(vk::AttachmentStoreOp::STORE)
+   901→            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+   902→            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+   903→            .initial_layout(vk::ImageLayout::UNDEFINED)
+   904→            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+   905→
+   906→        let depth_attach = vk::AttachmentDescription::default()
+   907→            .format(depth_format)
+   908→            .samples(vk::SampleCountFlags::TYPE_1)
+   909→            .load_op(vk::AttachmentLoadOp::CLEAR)
+   910→            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+   911→            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+   912→            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+   913→            .initial_layout(vk::ImageLayout::UNDEFINED)
+   914→            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+   915→
+   916→        let attachments = [color_attach, depth_attach];
+   917→
+   918→        let color_ref = vk::AttachmentReference::default()
+   919→            .attachment(0)
+   920→            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+   921→        let depth_ref = vk::AttachmentReference::default()
+   922→            .attachment(1)
+   923→            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+   924→
+   925→        let subpass = vk::SubpassDescription::default()
+   926→            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+   927→            .color_attachments(std::slice::from_ref(&color_ref))
+   928→            .depth_stencil_attachment(&depth_ref);
+   929→
+   930→        let dependency = vk::SubpassDependency::default()
+   931→            .src_subpass(vk::SUBPASS_EXTERNAL)
+   932→            .dst_subpass(0)
+   933→            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+   934→            .src_access_mask(vk::AccessFlags::empty())
+   935→            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+   936→            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+   937→
+   938→        let rp_create = vk::RenderPassCreateInfo::default()
+   939→            .attachments(&attachments)
+   940→            .subpasses(std::slice::from_ref(&subpass))
+   941→            .dependencies(std::slice::from_ref(&dependency));
+   942→        let render_pass = unsafe {
+   943→            ctx.device.create_render_pass(&rp_create, None)
+   944→                .map_err(|e| RenderError::Pipeline(format!("create_render_pass: {:?}", e)))?
+   945→        };
+   946→
+   947→        // Shaders
+   948→        let vert_module = load_shader(ctx, "tri.vert.spv")?;
+   949→        let frag_module = load_shader(ctx, "tri.frag.spv")?;
+   950→        let entry_name = CString::new("main").unwrap();
+   951→        let vert_stage = vk::PipelineShaderStageCreateInfo::default()
+   952→            .stage(vk::ShaderStageFlags::VERTEX)
+   953→            .module(vert_module)
+   954→            .name(&entry_name);
+   955→        let frag_stage = vk::PipelineShaderStageCreateInfo::default()
+   956→            .stage(vk::ShaderStageFlags::FRAGMENT)
+   957→            .module(frag_module)
+   958→            .name(&entry_name);
+   959→        let stages = [vert_stage, frag_stage];
+   960→
+   961→        let vertex_bindings = [vk::VertexInputBindingDescription::default()
+   962→            .binding(0)
+   963→            .stride(std::mem::size_of::<Vertex>() as u32)
+   964→            .input_rate(vk::VertexInputRate::VERTEX)];
+   965→        let vertex_attrs = [
+   966→            vk::VertexInputAttributeDescription::default()
+   967→                .location(0).binding(0)
+   968→                .format(vk::Format::R32G32B32_SFLOAT)
+   969→                .offset(0),
+   970→            vk::VertexInputAttributeDescription::default()
+   971→                .location(1).binding(0)
+   972→                .format(vk::Format::R32G32B32_SFLOAT)
+   973→                .offset(12),
+   974→        ];
+   975→        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+   976→            .vertex_binding_descriptions(&vertex_bindings)
+   977→            .vertex_attribute_descriptions(&vertex_attrs);
+   978→
+   979→        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+   980→            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+   981→            .primitive_restart_enable(false);
+   982→
+   983→        let viewport = vk::Viewport::default()
+   984→            .x(0.0).y(0.0)
+   985→            .width(extent.width as f32)
+   986→            .height(extent.height as f32)
+   987→            .min_depth(0.0).max_depth(1.0);
+   988→        let scissor = vk::Rect2D::default()
+   989→            .offset(vk::Offset2D { x: 0, y: 0 })
+   990→            .extent(extent);
+   991→        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+   992→            .viewports(std::slice::from_ref(&viewport))
+   993→            .scissors(std::slice::from_ref(&scissor));
+   994→
+   995→        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+   996→            .depth_clamp_enable(false)
+   997→            .rasterizer_discard_enable(false)
+   998→            .polygon_mode(vk::PolygonMode::FILL)
+   999→            .line_width(1.0)
+  1000→            // Cull back faces (the ones facing away from the camera) so a
+  1001→            // closed mesh like a cube draws correctly without the back faces
+  1002→            // showing through the front. With CCW front-facing winding and
+  1003→            // CULL_BACK, only front faces (those whose vertices are CCW
+  1004→            // when viewed from the camera) are rasterized.
+  1005→            .cull_mode(vk::CullModeFlags::BACK)
+  1006→            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+  1007→            .depth_bias_enable(false);
+  1008→
+  1009→        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+  1010→            .sample_shading_enable(false)
+  1011→            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+  1012→
+  1013→        // Depth/stencil state: enable depth testing with LESS compare (a
+  1014→        // fragment is drawn if its depth is less than what's already in the
+  1015→        // depth buffer), and enable depth writes so later fragments see
+  1016→        // the updated depth. No stencil testing.
+  1017→        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+  1018→            .depth_test_enable(true)
+  1019→            .depth_write_enable(true)
+  1020→            .depth_compare_op(vk::CompareOp::LESS)
+  1021→            .depth_bounds_test_enable(false)
+  1022→            .stencil_test_enable(false);
+  1023→
+  1024→        let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+  1025→            .color_write_mask(
+  1026→                vk::ColorComponentFlags::R
+  1027→                    | vk::ColorComponentFlags::G
+  1028→                    | vk::ColorComponentFlags::B
+  1029→                    | vk::ColorComponentFlags::A)
+  1030→            .blend_enable(false)];
+  1031→
+  1032→        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+  1033→            .logic_op_enable(false)
+  1034→            .attachments(&color_blend_attachments);
+  1035→
+  1036→        let pc_ranges = [vk::PushConstantRange::default()
+  1037→            .stage_flags(vk::ShaderStageFlags::VERTEX)
+  1038→            .offset(0)
+  1039→            .size(std::mem::size_of::<[f32; 16]>() as u32)];
+  1040→
+  1041→        let layout_create = vk::PipelineLayoutCreateInfo::default()
+  1042→            .push_constant_ranges(&pc_ranges);
+  1043→        let pipeline_layout = unsafe {
+  1044→            ctx.device.create_pipeline_layout(&layout_create, None)
+  1045→                .map_err(|e| RenderError::Pipeline(format!("create_pipeline_layout: {:?}", e)))?
+  1046→        };
+  1047→
+  1048→        let create = vk::GraphicsPipelineCreateInfo::default()
+  1049→            .stages(&stages)
+  1050→            .vertex_input_state(&vertex_input)
+  1051→            .input_assembly_state(&input_assembly)
+  1052→            .viewport_state(&viewport_state)
+  1053→            .rasterization_state(&rasterizer)
+  1054→            .multisample_state(&multisampling)
+  1055→            .depth_stencil_state(&depth_stencil)
+  1056→            .color_blend_state(&color_blend)
+  1057→            .layout(pipeline_layout)
+  1058→            .render_pass(render_pass)
+  1059→            .subpass(0);
+  1060→
+  1061→        let pipeline = unsafe {
+  1062→            ctx.device.create_graphics_pipelines(
+  1063→                vk::PipelineCache::null(),
+  1064→                std::slice::from_ref(&create),
+  1065→                None,
+  1066→            ).map_err(|(_pipelines, e)| RenderError::Pipeline(format!("create_graphics_pipelines: {:?}", e)))?[0]
+  1067→        };
+  1068→
+  1069→        Ok(Self {
+  1070→            render_pass,
+  1071→            pipeline,
+  1072→            pipeline_layout,
+  1073→            vert_module,
+  1074→            frag_module,
+  1075→        })
+  1076→    }
+  1077→
+  1078→    pub fn destroy(&mut self, ctx: &VkContext) {
+  1079→        unsafe {
+  1080→            ctx.device.destroy_pipeline(self.pipeline, None);
+  1081→            ctx.device.destroy_pipeline_layout(self.pipeline_layout, None);
+  1082→            ctx.device.destroy_render_pass(self.render_pass, None);
+  1083→            ctx.device.destroy_shader_module(self.vert_module, None);
+  1084→            ctx.device.destroy_shader_module(self.frag_module, None);
+  1085→        }
+  1086→    }
+  1087→}
+  1088→
+  1089→// =============================================================================
+  1090→// Swapchain (headless surface)
+  1091→// =============================================================================
+  1092→
+  1093→pub struct HeadlessSwapchain {
+  1094→    pub surface: vk::SurfaceKHR,
+  1095→    pub raw: vk::SwapchainKHR,
+  1096→    pub images: Vec<vk::Image>,
+  1097→    pub image_views: Vec<vk::ImageView>,
+  1098→    pub format: vk::Format,
+  1099→    pub extent: vk::Extent2D,
+  1100→    pub headless_loader: headless_surface::Instance,
+  1101→    pub surface_loader: ash::khr::surface::Instance,
+  1102→    pub swapchain_loader: ash::khr::swapchain::Device,
+  1103→}
+  1104→
+  1105→impl HeadlessSwapchain {
+  1106→    pub fn new(ctx: Arc<VkContext>, width: u32, height: u32) -> RenderResult<Self> {
+  1107→        let headless_loader = headless_surface::Instance::new(&ctx.entry, &ctx.instance);
+  1108→        let create = vk::HeadlessSurfaceCreateInfoEXT::default();
+  1109→        let surface = unsafe {
+  1110→            headless_loader.create_headless_surface(&create, None)
+  1111→                .map_err(|e| RenderError::SurfaceCreate(format!("{:?}", e)))?
+  1112→        };
+  1113→
+  1114→        let surface_loader = ash::khr::surface::Instance::new(&ctx.entry, &ctx.instance);
+  1115→
+  1116→        // query support
+  1117→        let capabilities = unsafe {
+  1118→            surface_loader.get_physical_device_surface_capabilities(ctx.physical_device, surface)
+  1119→                .map_err(|e| RenderError::SurfaceCreate(format!("get_surface_capabilities: {:?}", e)))?
+  1120→        };
+  1121→        let formats = unsafe {
+  1122→            surface_loader.get_physical_device_surface_formats(ctx.physical_device, surface)
+  1123→                .map_err(|e| RenderError::SurfaceCreate(format!("get_surface_formats: {:?}", e)))?
+  1124→        };
+  1125→        let present_modes = unsafe {
+  1126→            surface_loader.get_physical_device_surface_present_modes(ctx.physical_device, surface)
+  1127→                .map_err(|e| RenderError::SurfaceCreate(format!("get_surface_present_modes: {:?}", e)))?
+  1128→        };
+  1129→
+  1130→        log::info!(
+  1131→            "headless surface: formats={} present_modes={} caps={:?}",
+  1132→            formats.len(), present_modes.len(), capabilities
+  1133→        );
+  1134→
+  1135→        let format = formats.iter()
+  1136→            .find(|f| f.format == vk::Format::B8G8R8A8_UNORM)
+  1137→            .or_else(|| formats.first())
+  1138→            .copied()
+  1139→            .ok_or_else(|| RenderError::SwapchainCreate("no surface formats".into()))?;
+  1140→
+  1141→        let extent = vk::Extent2D {
+  1142→            width: width.clamp(capabilities.min_image_extent.width,
+  1143→                               capabilities.max_image_extent.width),
+  1144→            height: height.clamp(capabilities.min_image_extent.height,
+  1145→                                 capabilities.max_image_extent.height),
+  1146→        };
+  1147→        if extent.width == 0 || extent.height == 0 {
+  1148→            return Err(RenderError::SwapchainCreate(format!(
+  1149→                "Computed swapchain extent is zero: {:?}", extent)));
+  1150→        }
+  1151→
+  1152→        let mut image_count = capabilities.min_image_count + 1;
+  1153→        if capabilities.max_image_count > 0
+  1154→            && image_count > capabilities.max_image_count
+  1155→        {
+  1156→            image_count = capabilities.max_image_count;
+  1157→        }
+  1158→
+  1159→        let present_mode = if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+  1160→            vk::PresentModeKHR::MAILBOX
+  1161→        } else if present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+  1162→            vk::PresentModeKHR::IMMEDIATE
+  1163→        } else {
+  1164→            vk::PresentModeKHR::FIFO
+  1165→        };
+  1166→
+  1167→        log::info!(
+  1168→            "headless swapchain: {}x{} {:?} images={} present_mode={:?}",
+  1169→            extent.width, extent.height, format.format, image_count, present_mode
+  1170→        );
+  1171→
+  1172→        // Create swapchain (need to enable VK_KHR_swapchain on the device too)
+  1173→        let swap_ext = CString::new("VK_KHR_swapchain").unwrap();
+  1174→        let ext_names: [*const i8; 1] = [swap_ext.as_ptr()];
+  1175→
+  1176→        // Re-create device with the swapchain extension enabled if not already.
+  1177→        // We need to do this before creating the swapchain.
+  1178→        // Check if already enabled — but we know we didn't enable it earlier.
+  1179→        // For now, we recreate the device with the extension added.
+  1180→        // SAFETY: the existing device is not used afterwards, so we leak it.
+  1181→        // Actually a better approach is to enable the extension up-front in
+  1182→        // VkContext::new. We'll do that.
+  1183→
+  1184→        // For now we hack: directly create a swapchain via the KHR device extension.
+  1185→        // If the device wasn't created with VK_KHR_swapchain, this will fail
+  1186→        // with VK_ERROR_INITIALIZATION_FAILED. We'll handle that.
+  1187→
+  1188→        let create_swap = vk::SwapchainCreateInfoKHR::default()
+  1189→            .surface(surface)
+  1190→            .min_image_count(image_count)
+  1191→            .image_format(format.format)
+  1192→            .image_color_space(format.color_space)
+  1193→            .image_extent(extent)
+  1194→            .image_array_layers(1)
+  1195→            .image_usage(
+  1196→                vk::ImageUsageFlags::COLOR_ATTACHMENT
+  1197→                    | vk::ImageUsageFlags::TRANSFER_SRC
+  1198→                    | vk::ImageUsageFlags::TRANSFER_DST,
+  1199→            )
+  1200→            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+  1201→            .pre_transform(capabilities.current_transform)
+  1202→            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+  1203→            .present_mode(present_mode)
+  1204→            .clipped(true);
+  1205→
+  1206→        let swapchain_loader = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
+  1207→        let raw = unsafe {
+  1208→            swapchain_loader.create_swapchain(&create_swap, None)
+  1209→                .map_err(|e| {
+  1210→                    log::error!("create_swapchain failed: {:?} — likely VK_KHR_swapchain not enabled on device", e);
+  1211→                    RenderError::SwapchainCreate(format!("{:?}", e))
+  1212→                })?
+  1213→        };
+  1214→
+  1215→        let images = unsafe {
+  1216→            swapchain_loader.get_swapchain_images(raw)
+  1217→                .map_err(|e| RenderError::SwapchainCreate(format!("get_swapchain_images: {:?}", e)))?
+  1218→        };
+  1219→
+  1220→        let mut image_views = Vec::with_capacity(images.len());
+  1221→        for img in &images {
+  1222→            let view_create = vk::ImageViewCreateInfo::default()
+  1223→                .image(*img)
+  1224→                .view_type(vk::ImageViewType::TYPE_2D)
+  1225→                .format(format.format)
+  1226→                .components(vk::ComponentMapping::default())
+  1227→                .subresource_range(vk::ImageSubresourceRange {
+  1228→                    aspect_mask: vk::ImageAspectFlags::COLOR,
+  1229→                    base_mip_level: 0,
+  1230→                    level_count: 1,
+  1231→                    base_array_layer: 0,
+  1232→                    layer_count: 1,
+  1233→                });
+  1234→            let view = unsafe {
+  1235→                ctx.device.create_image_view(&view_create, None)
+  1236→                    .map_err(|e| RenderError::SwapchainCreate(format!("create_image_view: {:?}", e)))?
+  1237→            };
+  1238→            image_views.push(view);
+  1239→        }
+  1240→
+  1241→        let _ = ext_names;
+  1242→        Ok(Self {
+  1243→            surface,
+  1244→            raw,
+  1245→            images,
+  1246→            image_views,
+  1247→            format: format.format,
+  1248→            extent,
+  1249→            headless_loader,
+  1250→            surface_loader,
+  1251→            swapchain_loader,
+  1252→        })
+  1253→    }
+  1254→
+  1255→    pub fn acquire_next_image(
+  1256→        &self,
+  1257→        _ctx: &VkContext,
+  1258→        semaphore: vk::Semaphore,
+  1259→    ) -> RenderResult<u32> {
+  1260→        // The Vulkan acquire call lives on `swapchain_loader`, which already
+  1261→        // holds a reference to the logical device. The `ctx` parameter is kept
+  1262→        // in the signature so future swapchain-recreation paths can consult the
+  1263→        // physical-device capabilities when the surface is invalidated.
+  1264→        unsafe {
+  1265→            match self.swapchain_loader.acquire_next_image(self.raw, u64::MAX, semaphore, vk::Fence::null()) {
+  1266→                Ok((idx, _suboptimal)) => Ok(idx),
+  1267→                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(0),
+  1268→                Err(e) => Err(RenderError::AcquireImage(format!("{:?}", e))),
+  1269→            }
+  1270→        }
+  1271→    }
+  1272→
+  1273→    pub fn present(&self, ctx: &VkContext, image_index: u32, wait_semaphores: &[vk::Semaphore]) -> RenderResult<()> {
+  1274→        let present_info = vk::PresentInfoKHR::default()
+  1275→            .wait_semaphores(wait_semaphores)
+  1276→            .swapchains(std::slice::from_ref(&self.raw))
+  1277→            .image_indices(std::slice::from_ref(&image_index));
+  1278→        unsafe {
+  1279→            self.swapchain_loader.queue_present(ctx.graphics_queue, &present_info)
+  1280→                .map_err(|e| RenderError::Present(format!("{:?}", e)))?;
+  1281→        }
+  1282→        // `ctx` is required by the API surface even though we only need the
+  1283→        // graphics queue (which lives on `ctx`). Keep it explicit so future
+  1284→        // multi-queue variants can plug in here without rewriting the
+  1285→        // signature.
+  1286→        let _ = ctx;
+  1287→        Ok(())
+  1288→    }
+  1289→}
+  1290→
+  1291→impl Drop for HeadlessSwapchain {
+  1292→    fn drop(&mut self) {
+  1293→        // SAFETY: only call if device is alive. We assume VkContext outlives
+  1294→        // the swapchain (it does — VkContext is held in Arc inside Backend).
+  1295→        // But we don't have the device here. So callers must use destroy().
+  1296→    }
+  1297→}
+  1298→
+  1299→impl HeadlessSwapchain {
+  1300→    pub fn destroy(&mut self, ctx: &VkContext) {
+  1301→        unsafe {
+  1302→            for v in self.image_views.drain(..) {
+  1303→                ctx.device.destroy_image_view(v, None);
+  1304→            }
+  1305→            self.swapchain_loader.destroy_swapchain(self.raw, None);
+  1306→            self.surface_loader.destroy_surface(self.surface, None);
+  1307→        }
+  1308→    }
+  1309→}
+  1310→
+  1311→// =============================================================================
+  1312→// Command pool + sync
+  1313→// =============================================================================
+  1314→
+  1315→pub struct Frame {
+  1316→    pub command_pool: vk::CommandPool,
+  1317→    pub command_buffers: Vec<vk::CommandBuffer>,
+  1318→    pub image_available: Vec<vk::Semaphore>,
+  1319→    pub render_finished: Vec<vk::Semaphore>,
+  1320→    pub in_flight: Vec<vk::Fence>,
+  1321→    pub framebuffers: Vec<vk::Framebuffer>,
+  1322→    pub current: usize,
+  1323→    pub frames_in_flight: usize,
+  1324→}
+  1325→
+  1326→impl Frame {
+  1327→    pub fn new(
+  1328→        ctx: &VkContext,
+  1329→        extent: vk::Extent2D,
+  1330→        render_pass: vk::RenderPass,
+  1331→        image_views: &[vk::ImageView],
+  1332→        depth_view: vk::ImageView,
+  1333→        frames_in_flight: usize,
+  1334→    ) -> RenderResult<Self> {
+  1335→        let pool_create = vk::CommandPoolCreateInfo::default()
+  1336→            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+  1337→            .queue_family_index(ctx.graphics_queue_family);
+  1338→        let command_pool = unsafe {
+  1339→            ctx.device.create_command_pool(&pool_create, None)
+  1340→                .map_err(|e| RenderError::Other(format!("create_command_pool: {:?}", e)))?
+  1341→        };
+  1342→
+  1343→        let mut command_buffers = Vec::with_capacity(frames_in_flight);
+  1344→        for _ in 0..frames_in_flight {
+  1345→            let alloc = vk::CommandBufferAllocateInfo::default()
+  1346→                .command_pool(command_pool)
+  1347→                .level(vk::CommandBufferLevel::PRIMARY)
+  1348→                .command_buffer_count(1);
+  1349→            let cmd = unsafe {
+  1350→                ctx.device.allocate_command_buffers(&alloc)
+  1351→                    .map_err(|e| RenderError::Other(format!("allocate_command_buffers: {:?}", e)))?[0]
+  1352→            };
+  1353→            command_buffers.push(cmd);
+  1354→        }
+  1355→
+  1356→        let mut image_available = Vec::with_capacity(frames_in_flight);
+  1357→        let mut render_finished = Vec::with_capacity(frames_in_flight);
+  1358→        let mut in_flight = Vec::with_capacity(frames_in_flight);
+  1359→        let sem_create = vk::SemaphoreCreateInfo::default();
+  1360→        let fence_create = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+  1361→        for _ in 0..frames_in_flight {
+  1362→            let s1 = unsafe { ctx.device.create_semaphore(&sem_create, None)
+  1363→                .map_err(|e| RenderError::Other(format!("create_semaphore: {:?}", e)))? };
+  1364→            let s2 = unsafe { ctx.device.create_semaphore(&sem_create, None)
+  1365→                .map_err(|e| RenderError::Other(format!("create_semaphore: {:?}", e)))? };
+  1366→            let f = unsafe { ctx.device.create_fence(&fence_create, None)
+  1367→                .map_err(|e| RenderError::Other(format!("create_fence: {:?}", e)))? };
+  1368→            image_available.push(s1);
+  1369→            render_finished.push(s2);
+  1370→            in_flight.push(f);
+  1371→        }
+  1372→
+  1373→        // Each framebuffer gets BOTH the color image view (per swapchain image)
+  1374→        // AND the shared depth image view. The render pass references them by
+  1375→        // index: 0 = color, 1 = depth. The depth image is shared across all
+  1376→        // framebuffers because we serialize GPU work with fences and never
+  1377→        // access the depth attachment from two frames concurrently.
+  1378→        let mut framebuffers = Vec::with_capacity(image_views.len());
+  1379→        for view in image_views {
+  1380→            let attachments = [*view, depth_view];
+  1381→            let fb_create = vk::FramebufferCreateInfo::default()
+  1382→                .render_pass(render_pass)
+  1383→                .attachments(&attachments)
+  1384→                .width(extent.width)
+  1385→                .height(extent.height)
+  1386→                .layers(1);
+  1387→            let fb = unsafe {
+  1388→                ctx.device.create_framebuffer(&fb_create, None)
+  1389→                    .map_err(|e| RenderError::Pipeline(format!("create_framebuffer: {:?}", e)))?
+  1390→            };
+  1391→            framebuffers.push(fb);
+  1392→        }
+  1393→
+  1394→        Ok(Self {
+  1395→            command_pool,
+  1396→            command_buffers,
+  1397→            image_available,
+  1398→            render_finished,
+  1399→            in_flight,
+  1400→            framebuffers,
+  1401→            current: 0,
+  1402→            frames_in_flight,
+  1403→        })
+  1404→    }
+  1405→
+  1406→    pub fn destroy(&mut self, ctx: &VkContext) {
+  1407→        unsafe {
+  1408→            for fb in self.framebuffers.drain(..) {
+  1409→                ctx.device.destroy_framebuffer(fb, None);
+  1410→            }
+  1411→            for s in self.image_available.drain(..) {
+  1412→                ctx.device.destroy_semaphore(s, None);
+  1413→            }
+  1414→            for s in self.render_finished.drain(..) {
+  1415→                ctx.device.destroy_semaphore(s, None);
+  1416→            }
+  1417→            for f in self.in_flight.drain(..) {
+  1418→                ctx.device.destroy_fence(f, None);
+  1419→            }
+  1420→            ctx.device.destroy_command_pool(self.command_pool, None);
+  1421→        }
+  1422→    }
+  1423→}
+  1424→
+  1425→// =============================================================================
+  1426→// Browser Render Observatory
+  1427→// =============================================================================
+  1428→
+  1429→pub struct FrameSnapshot {
+  1430→    pub bytes: Vec<u8>,    // BGRA8
+  1431→    pub width: u32,
+  1432→    pub height: u32,
+  1433→    pub frame_index: u64,
+  1434→}
+  1435→
+  1436→impl Default for FrameSnapshot {
+  1437→    fn default() -> Self {
+  1438→        Self { bytes: Vec::new(), width: 0, height: 0, frame_index: 0 }
+  1439→    }
+  1440→}
+  1441→
+  1442→pub struct Observatory {
+  1443→    pub latest: Arc<Mutex<FrameSnapshot>>,
+  1444→    pub _server: Option<std::thread::JoinHandle<()>>,
+  1445→}
+  1446→
+  1447→impl Observatory {
+  1448→    pub fn start(addr: &str) -> Self {
+  1449→        let latest: Arc<Mutex<FrameSnapshot>> = Arc::new(Mutex::new(FrameSnapshot::default()));
+  1450→        let latest_inner = latest.clone();
+  1451→        let addr_owned: String = addr.to_string();
+  1452→
+  1453→        let handle = std::thread::spawn(move || {
+  1454→            let server = match Server::http(addr_owned.as_str()) {
+  1455→                Ok(s) => s,
+  1456→                Err(e) => {
+  1457→                    eprintln!("Observatory server bind failed: {e:?}");
+  1458→                    return;
+  1459→                }
+  1460→            };
+  1461→            for request in server.incoming_requests() {
+  1462→                let url = request.url().to_string();
+  1463→                let (resp, ct): (Vec<u8>, &'static str) = if url == "/" {
+  1464→                    (HTML_VIEWER.as_bytes().to_vec(), "text/html; charset=utf-8")
+  1465→                } else if url == "/frame.png" {
+  1466→                    let snap = latest_inner.lock();
+  1467→                    if snap.bytes.is_empty() {
+  1468→                        (b"not yet rendered".to_vec(), "text/plain")
+  1469→                    } else {
+  1470→                        let png = bgra_to_png(&snap.bytes, snap.width, snap.height);
+  1471→                        (png, "image/png")
+  1472→                    }
+  1473→                } else if url == "/frame.raw" {
+  1474→                    let snap = latest_inner.lock();
+  1475→                    (snap.bytes.clone(), "application/octet-stream")
+  1476→                } else if url == "/debug/state" {
+  1477→                    let snap = latest_inner.lock();
+  1478→                    let json = format!(
+  1479→                        r#"{{"width":{},"height":{},"frame_index":{},"bytes":{}}}"#,
+  1480→                        snap.width, snap.height, snap.frame_index, snap.bytes.len()
+  1481→                    );
+  1482→                    (json.into_bytes(), "application/json")
+  1483→                } else {
+  1484→                    (b"not found".to_vec(), "text/plain")
+  1485→                };
+  1486→                let mut response = Response::from_data(resp);
+  1487→                let _ = response.add_header(Header::from_bytes(
+  1488→                    b"Content-Type", ct.as_bytes()
+  1489→                ).unwrap());
+  1490→                let _ = request.respond(response);
+  1491→            }
+  1492→        });
+  1493→
+  1494→        Self { latest, _server: Some(handle) }
+  1495→    }
+  1496→
+  1497→    pub fn publish(&self, bytes: Vec<u8>, width: u32, height: u32, frame_index: u64) {
+  1498→        let mut snap = self.latest.lock();
+  1499→        snap.bytes = bytes;
+  1500→        snap.width = width;
+  1501→        snap.height = height;
+  1502→        snap.frame_index = frame_index;
+  1503→    }
+  1504→}
+  1505→
+  1506→fn bgra_to_png(bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
+  1507→    use image::ImageEncoder;
+  1508→    let mut rgba = Vec::with_capacity(bgra.len());
+  1509→    for chunk in bgra.chunks_exact(4) {
+  1510→        rgba.push(chunk[2]); // R
+  1511→        rgba.push(chunk[1]); // G
+  1512→        rgba.push(chunk[0]); // B
+  1513→        rgba.push(chunk[3]); // A
+  1514→    }
+  1515→    let mut out = Vec::new();
+  1516→    let enc = image::codecs::png::PngEncoder::new(&mut out);
+  1517→    enc.write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+  1518→        .expect("png encode");
+  1519→    out
+  1520→}
+  1521→
+  1522→const HTML_VIEWER: &str = r#"<!doctype html>
+  1523→<html>
+  1524→<head>
+  1525→<meta charset="utf-8">
+  1526→<title>Arcane — Render Observatory</title>
+  1527→<style>
+  1528→  body { background:#08080c; color:#e6e6f0; font-family:system-ui,sans-serif; margin:0; padding:16px; }
+  1529→  h1 { font-size:14pt; margin:0 0 8pt; }
+  1530→  .meta { font-size:10pt; color:#999; margin-bottom:12pt; }
+  1531→  canvas { image-rendering: pixelated; width:800px; height:600px; border:1px solid #333; }
+  1532→  .controls { margin:8pt 0; }
+  1533→  button { background:#222; color:#eee; border:1px solid #444; padding:4pt 8pt; cursor:pointer; }
+  1534→</style>
+  1535→</head>
+  1536→<body>
+  1537→<h1>Mystical Arcana &mdash; Render Observatory</h1>
+  1538→<div class="meta" id="meta">Loading...</div>
+  1539→<div class="controls">
+  1540→  <button id="toggle">Pause</button>
+  1541→  <input type="range" id="fps" min="1" max="60" value="10"> <span id="fpsLabel">10 FPS</span>
+  1542→</div>
+  1543→<canvas id="c" width="800" height="600"></canvas>
+  1544→
+  1545→<script>
+  1546→let paused = false;
+  1547→let lastFrameIdx = -1;
+  1548→const canvas = document.getElementById('c');
+  1549→const ctx = canvas.getContext('2d');
+  1550→const meta = document.getElementById('meta');
+  1551→const fpsSlider = document.getElementById('fps');
+  1552→const fpsLabel = document.getElementById('fpsLabel');
+  1553→
+  1554→function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+  1555→
+  1556→async function loadFrame() {
+  1557→  try {
+  1558→    const resp = await fetch('/frame.raw', { cache: 'no-store' });
+  1559→    if (!resp.ok) { meta.textContent = 'frame fetch failed: ' + resp.status; return; }
+  1560→    const buf = await resp.arrayBuffer();
+  1561→    const state = await (await fetch('/debug/state', { cache: 'no-store' })).json();
+  1562→    if (state.frame_index !== lastFrameIdx) {
+  1563→      lastFrameIdx = state.frame_index;
+  1564→      meta.textContent = `frame ${state.frame_index} (${state.width}x${state.height})`;
+  1565→    }
+  1566→    if (state.width === 0 || state.height === 0) return;
+  1567→    const u8 = new Uint8Array(buf);
+  1568→    const rgba = new Uint8ClampedArray(u8.length);
+  1569→    for (let i = 0; i < u8.length; i += 4) {
+  1570→      rgba[i] = u8[i+2];
+  1571→      rgba[i+1] = u8[i+1];
+  1572→      rgba[i+2] = u8[i+0];
+  1573→      rgba[i+3] = u8[i+3];
+  1574→    }
+  1575→    const img = new ImageData(rgba, state.width, state.height);
+  1576→    canvas.width = state.width;
+  1577→    canvas.height = state.height;
+  1578→    ctx.putImageData(img, 0, 0);
+  1579→  } catch (e) {
+  1580→    meta.textContent = 'error: ' + e;
+  1581→  }
+  1582→}
+  1583→
+  1584→async function loop() {
+  1585→  while (true) {
+  1586→    if (!paused) await loadFrame();
+  1587→    const ms = 1000 / parseInt(fpsSlider.value, 10);
+  1588→    fpsLabel.textContent = fpsSlider.value + ' FPS';
+  1589→    await delay(ms);
+  1590→  }
+  1591→}
+  1592→
+  1593→document.getElementById('toggle').addEventListener('click', () => {
+  1594→  paused = !paused;
+  1595→  document.getElementById('toggle').textContent = paused ? 'Resume' : 'Pause';
+  1596→});
+  1597→
+  1598→loop();
+  1599→</script>
+  1600→</body>
+  1601→</html>
+  1602→"#;
+  1603→
+  1604→// =============================================================================
+  1605→// Backend
+  1606→// =============================================================================
+  1607→
+  1608→pub struct Backend {
+  1609→    pub ctx: Arc<VkContext>,
+  1610→    pub swapchain: HeadlessSwapchain,
+  1611→    pub depth: DepthBuffer,
+  1612→    pub pipeline: Pipeline,
+  1613→    pub frame: Frame,
+  1614→    pub mesh: CubeMesh,
+  1615→    pub observatory: Observatory,
+  1616→    pub readback: Buffer,
+  1617→    pub width: u32,
+  1618→    pub height: u32,
+  1619→}
+  1620→
+  1621→impl Backend {
+  1622→    pub fn new(width: u32, height: u32) -> RenderResult<Self> {
+  1623→        Self::with_observatory(width, height, "0.0.0.0:8080")
+  1624→    }
+  1625→
+  1626→    /// Same as [`Backend::new`] but lets the caller pick the Observatory bind
+  1627→    /// address. Pass e.g. `"127.0.0.1:9999"` to scope to localhost and a
+  1628→    /// non-default port, or `"0.0.0.0:8080"` (the default) to expose to the
+  1629→    /// host network.
+  1630→    pub fn with_observatory(
+  1631→        width: u32,
+  1632→        height: u32,
+  1633→        observatory_addr: &str,
+  1634→    ) -> RenderResult<Self> {
+  1635→        let ctx = VkContext::new("Mystical Arcana", cfg!(debug_assertions))?;
+  1636→        log::info!("Vulkan context: device = {}", ctx.device_name());
+  1637→
+  1638→        let swapchain = HeadlessSwapchain::new(ctx.clone(), width, height)?;
+  1639→        let depth = DepthBuffer::new(&ctx, swapchain.extent)?;
+  1640→        let pipeline = Pipeline::new(&ctx, swapchain.format, depth.format, swapchain.extent)?;
+  1641→        let frame = Frame::new(
+  1642→            &ctx,
+  1643→            swapchain.extent,
+  1644→            pipeline.render_pass,
+  1645→            &swapchain.image_views,
+  1646→            depth.view,
+  1647→            2,
+  1648→        )?;
+  1649→        let mesh = CubeMesh::new(&ctx)?;
+  1650→        let observatory = Observatory::start(observatory_addr);
+  1651→
+  1652→        let bytes_needed = (width as u64) * (height as u64) * 4;
+  1653→        let readback = Buffer::new(
+  1654→            &ctx,
+  1655→            bytes_needed,
+  1656→            vk::BufferUsageFlags::TRANSFER_DST,
+  1657→            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+  1658→        )?;
+  1659→
+  1660→        Ok(Self {
+  1661→            ctx,
+  1662→            swapchain,
+  1663→            depth,
+  1664→            pipeline,
+  1665→            frame,
+  1666→            mesh,
+  1667→            observatory,
+  1668→            readback,
+  1669→            width,
+  1670→            height,
+  1671→        })
+  1672→    }
+  1673→
+  1674→    pub fn render_one(&mut self, frame_index: u64) -> RenderResult<()> {
+  1675→        // Default single-cube scene for backwards compatibility: a single
+  1676→        // cube at the origin rotating around Y. Real scenes should call
+  1677→        // `render_objects` with a list of model matrices instead.
+  1678→        use arcane_math::Mat4;
+  1679→        let angle = (frame_index as f32) * 0.05;
+  1680→        let model = Mat4::from_rotation_y(angle);
+  1681→        self.render_objects(frame_index, std::slice::from_ref(&model))
+  1682→    }
+  1683→
+  1684→    /// Render a scene containing many cube instances, each transformed by
+  1685→    /// its own model matrix. All instances share the same vertex/index
+  1686→    /// buffers and the same graphics pipeline; the per-instance MVP is
+  1687→    /// pushed as a 64-byte push constant before each draw.
+  1688→    ///
+  1689→    /// The view and projection matrices are computed internally from the
+  1690→    /// framebuffer dimensions (so the aspect ratio is always right). The
+  1691→    /// camera sits at (0, 0, +5) in world space looking at the origin
+  1692→    /// with a 60 degree vertical FOV.
+  1693→    pub fn render_objects(
+  1694→        &mut self,
+  1695→        frame_index: u64,
+  1696→        models: &[arcane_math::Mat4],
+  1697→    ) -> RenderResult<()> {
+  1698→        use arcane_math::{Mat4, Vec3, mat4_to_cols_array, vulkan_perspective};
+  1699→
+  1700→        let aspect = self.width as f32 / self.height as f32;
+  1701→        let proj: Mat4 = vulkan_perspective(
+  1702→            60.0f32.to_radians(),
+  1703→            aspect,
+  1704→            0.1,
+  1705→            100.0,
+  1706→        );
+  1707→        let view: Mat4 = Mat4::from_translation(Vec3::new(0.0, 0.0, -5.0));
+  1708→        let view_proj: Mat4 = proj * view;
+  1709→        // Precompute each instance's MVP as a [f32; 16] so the recording
+  1710→        // loop doesn't allocate or recompute per draw call.
+  1711→        let mvps: Vec<[f32; 16]> = models
+  1712→            .iter()
+  1713→            .map(|m| mat4_to_cols_array(view_proj * *m))
+  1714→            .collect();
+  1715→
+  1716→        let current = self.frame.current;
+  1717→        let in_flight = self.frame.in_flight[current];
+  1718→        let image_available = self.frame.image_available[current];
+  1719→        let render_finished = self.frame.render_finished[current];
+  1720→        let cmd = self.frame.command_buffers[current];
+  1721→
+  1722→        unsafe {
+  1723→            self.ctx.device.wait_for_fences(std::slice::from_ref(&in_flight), true, u64::MAX)
+  1724→                .map_err(|e| RenderError::Other(format!("wait_for_fences: {:?}", e)))?;
+  1725→            self.ctx.device.reset_fences(std::slice::from_ref(&in_flight))
+  1726→                .map_err(|e| RenderError::Other(format!("reset_fences: {:?}", e)))?;
+  1727→        }
+  1728→
+  1729→        let image_index = self.swapchain.acquire_next_image(&self.ctx, image_available)?;
+  1730→
+  1731→        unsafe {
+  1732→            self.ctx.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+  1733→                .map_err(|e| RenderError::Other(format!("reset_command_buffer: {:?}", e)))?;
+  1734→        }
+  1735→
+  1736→        self.record_draw(cmd, image_index, &mvps)?;
+  1737→
+  1738→        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+  1739→        let wait_semaphores = [image_available];
+  1740→        let signal_semaphores = [render_finished];
+  1741→        let cmd_buffers = [cmd];
+  1742→        let submit_info = vk::SubmitInfo::default()
+  1743→            .wait_semaphores(&wait_semaphores)
+  1744→            .wait_dst_stage_mask(&wait_stages)
+  1745→            .command_buffers(&cmd_buffers)
+  1746→            .signal_semaphores(&signal_semaphores);
+  1747→        unsafe {
+  1748→            self.ctx.device.queue_submit(
+  1749→                self.ctx.graphics_queue,
+  1750→                std::slice::from_ref(&submit_info),
+  1751→                in_flight,
+  1752→            ).map_err(|e| RenderError::Submit(format!("{:?}", e)))?;
+  1753→        }
+  1754→
+  1755→        self.swapchain.present(&self.ctx, image_index, &[render_finished])?;
+  1756→
+  1757→        // Readback: copy the swapchain image back to host-visible buffer.
+  1758→        self.readback_image(image_index)?;
+  1759→
+  1760→        // Publish to observatory.
+  1761→        let bytes = self.readback.read_bytes().to_vec();
+  1762→        self.observatory.publish(bytes, self.width, self.height, frame_index);
+  1763→
+  1764→        self.frame.current = (self.frame.current + 1) % self.frame.frames_in_flight;
+  1765→        Ok(())
+  1766→    }
+  1767→
+  1768→    fn record_draw(
+  1769→        &self,
+  1770→        cmd: vk::CommandBuffer,
+  1771→        image_index: u32,
+  1772→        mvps: &[[f32; 16]],
+  1773→    ) -> RenderResult<()> {
+  1774→        let extent = self.swapchain.extent;
+  1775→        let framebuffer = self.frame.framebuffers[image_index as usize];
+  1776→
+  1777→        let clear_values = [
+  1778→            vk::ClearValue {
+  1779→                color: vk::ClearColorValue {
+  1780→                    float32: [0.05, 0.05, 0.08, 1.0],
+  1781→                },
+  1782→            },
+  1783→            // Depth clear = 1.0 (far plane). LESS compare means a fragment
+  1784→            // passes only if its depth is < the buffer value, so starting
+  1785→            // from 1.0 means everything in front of the far plane passes
+  1786→            // on the first write.
+  1787→            vk::ClearValue {
+  1788→                depth_stencil: vk::ClearDepthStencilValue {
+  1789→                    depth: 1.0,
+  1790→                    stencil: 0,
+  1791→                },
+  1792→            },
+  1793→        ];
+  1794→
+  1795→        let render_begin = vk::RenderPassBeginInfo::default()
+  1796→            .render_pass(self.pipeline.render_pass)
+  1797→            .framebuffer(framebuffer)
+  1798→            .render_area(vk::Rect2D {
+  1799→                offset: vk::Offset2D { x: 0, y: 0 },
+  1800→                extent,
+  1801→            })
+  1802→            .clear_values(&clear_values);
+  1803→
+  1804→        let begin_info = vk::CommandBufferBeginInfo::default()
+  1805→            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+  1806→
+  1807→        unsafe {
+  1808→            self.ctx.device.begin_command_buffer(cmd, &begin_info)
+  1809→                .map_err(|e| RenderError::Other(format!("begin_command_buffer: {:?}", e)))?;
+  1810→            self.ctx.device.cmd_begin_render_pass(cmd, &render_begin, vk::SubpassContents::INLINE);
+  1811→            self.ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline.pipeline);
+  1812→            self.ctx.device.cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.mesh.mesh.vertex.raw), &[0]);
+  1813→            self.ctx.device.cmd_bind_index_buffer(cmd, self.mesh.mesh.index.raw, 0, vk::IndexType::UINT16);
+  1814→
+  1815→            // Per-instance loop: push the instance's MVP, then draw the
+  1816→            // cube. The pipeline, vertex buffer, and index buffer are
+  1817→            // bound once outside the loop (Vulkan bind-once-draw-many).
+  1818→            for mvp in mvps {
+  1819→                let mvp_bytes: &[u8] = std::slice::from_raw_parts(
+  1820→                    mvp.as_ptr() as *const u8,
+  1821→                    std::mem::size_of::<[f32; 16]>(),
+  1822→                );
+  1823→                self.ctx.device.cmd_push_constants(
+  1824→                    cmd,
+  1825→                    self.pipeline.pipeline_layout,
+  1826→                    vk::ShaderStageFlags::VERTEX,
+  1827→                    0,
+  1828→                    mvp_bytes,
+  1829→                );
+  1830→                self.ctx.device.cmd_draw_indexed(cmd, self.mesh.mesh.index_count, 1, 0, 0, 0);
+  1831→            }
+  1832→            self.ctx.device.cmd_end_render_pass(cmd);
+  1833→            self.ctx.device.end_command_buffer(cmd)
+  1834→                .map_err(|e| RenderError::Other(format!("end_command_buffer: {:?}", e)))?;
+  1835→        }
+  1836→        Ok(())
+  1837→    }
+  1838→
+  1839→    fn readback_image(&self, image_index: u32) -> RenderResult<()> {
+  1840→        let extent = self.swapchain.extent;
+  1841→        let image = self.swapchain.images[image_index as usize];
+  1842→
+  1843→        // Allocate a one-shot command buffer from the existing pool.
+  1844→        let alloc = vk::CommandBufferAllocateInfo::default()
+  1845→            .command_pool(self.frame.command_pool)
+  1846→            .level(vk::CommandBufferLevel::PRIMARY)
+  1847→            .command_buffer_count(1);
+  1848→        let cmd = unsafe {
+  1849→            self.ctx.device.allocate_command_buffers(&alloc)
+  1850→                .map_err(|e| RenderError::Other(format!("allocate_command_buffers (readback): {:?}", e)))?[0]
+  1851→        };
+  1852→
+  1853→        unsafe {
+  1854→            let begin = vk::CommandBufferBeginInfo::default()
+  1855→                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+  1856→            self.ctx.device.begin_command_buffer(cmd, &begin)
+  1857→                .map_err(|e| RenderError::Other(format!("begin_command_buffer (readback): {:?}", e)))?;
+  1858→
+  1859→            // Image layout: PRESENT_SRC_KHR -> TRANSFER_SRC_OPTIMAL
+  1860→            let barrier = vk::ImageMemoryBarrier::default()
+  1861→                .image(image)
+  1862→                .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+  1863→                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+  1864→                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+  1865→                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+  1866→                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+  1867→                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+  1868→                .subresource_range(vk::ImageSubresourceRange {
+  1869→                    aspect_mask: vk::ImageAspectFlags::COLOR,
+  1870→                    base_mip_level: 0,
+  1871→                    level_count: 1,
+  1872→                    base_array_layer: 0,
+  1873→                    layer_count: 1,
+  1874→                });
+  1875→            self.ctx.device.cmd_pipeline_barrier(
+  1876→                cmd,
+  1877→                vk::PipelineStageFlags::ALL_COMMANDS,
+  1878→                vk::PipelineStageFlags::TRANSFER,
+  1879→                vk::DependencyFlags::empty(),
+  1880→                &[],
+  1881→                &[],
+  1882→                std::slice::from_ref(&barrier),
+  1883→            );
+  1884→
+  1885→            let region = vk::BufferImageCopy::default()
+  1886→                .image_subresource(vk::ImageSubresourceLayers {
+  1887→                    aspect_mask: vk::ImageAspectFlags::COLOR,
+  1888→                    mip_level: 0,
+  1889→                    base_array_layer: 0,
+  1890→                    layer_count: 1,
+  1891→                })
+  1892→                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+  1893→                .image_extent(vk::Extent3D {
+  1894→                    width: extent.width,
+  1895→                    height: extent.height,
+  1896→                    depth: 1,
+  1897→                });
+  1898→            self.ctx.device.cmd_copy_image_to_buffer(
+  1899→                cmd,
+  1900→                image,
+  1901→                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+  1902→                self.readback.raw,
+  1903→                std::slice::from_ref(&region),
+  1904→            );
+  1905→
+  1906→            // Image back to PRESENT_SRC_KHR
+  1907→            let barrier2 = vk::ImageMemoryBarrier::default()
+  1908→                .image(image)
+  1909→                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+  1910→                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+  1911→                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+  1912→                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+  1913→                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+  1914→                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+  1915→                .subresource_range(vk::ImageSubresourceRange {
+  1916→                    aspect_mask: vk::ImageAspectFlags::COLOR,
+  1917→                    base_mip_level: 0,
+  1918→                    level_count: 1,
+  1919→                    base_array_layer: 0,
+  1920→                    layer_count: 1,
+  1921→                });
+  1922→            self.ctx.device.cmd_pipeline_barrier(
+  1923→                cmd,
+  1924→                vk::PipelineStageFlags::TRANSFER,
+  1925→                vk::PipelineStageFlags::ALL_COMMANDS,
+  1926→                vk::DependencyFlags::empty(),
+  1927→                &[],
+  1928→                &[],
+  1929→                std::slice::from_ref(&barrier2),
+  1930→            );
+  1931→
+  1932→            self.ctx.device.end_command_buffer(cmd)
+  1933→                .map_err(|e| RenderError::Other(format!("end_command_buffer (readback): {:?}", e)))?;
+  1934→        }
+  1935→
+  1936→        let submit_info = vk::SubmitInfo::default()
+  1937→            .command_buffers(std::slice::from_ref(&cmd));
+  1938→        unsafe {
+  1939→            self.ctx.device.queue_submit(
+  1940→                self.ctx.graphics_queue,
+  1941→                std::slice::from_ref(&submit_info),
+  1942→                vk::Fence::null(),
+  1943→            ).map_err(|e| RenderError::Submit(format!("readback submit: {:?}", e)))?;
+  1944→            self.ctx.device.queue_wait_idle(self.ctx.graphics_queue)
+  1945→                .map_err(|e| RenderError::Other(format!("readback wait: {:?}", e)))?;
+  1946→            self.ctx.device.free_command_buffers(self.frame.command_pool, std::slice::from_ref(&cmd));
+  1947→        }
+  1948→        Ok(())
+  1949→    }
+  1950→}
+  1951→
+  1952→impl Drop for Backend {
+  1953→    fn drop(&mut self) {
+  1954→        // Wait for device idle before any destruction
+  1955→        unsafe { let _ = self.ctx.device.device_wait_idle(); }
+  1956→        // Drop order is the reverse of construction:
+  1957→        //   readback (host buffer)
+  1958→        //   mesh (vertex/index buffers)
+  1959→        //   pipeline (graphics pipeline + render pass + shaders + pipeline layout)
+  1960→        //   frame (framebuffers + sync objects + command pool)
+  1961→        //   depth (depth image + view + memory)
+  1962→        //   swapchain (surface + image views + raw swapchain)
+  1963→        // The VkContext (instance + device + physical device) outlives all
+  1964→        // of these because it's held in an Arc and dropped last when the
+  1965→        // Backend is consumed.
+  1966→        self.readback.destroy(&self.ctx);
+  1967→        self.mesh.destroy(&self.ctx);
+  1968→        self.pipeline.destroy(&self.ctx);
+  1969→        self.frame.destroy(&self.ctx);
+  1970→        self.depth.destroy(&self.ctx);
+  1971→        self.swapchain.destroy(&self.ctx);
+  1972→    }
+  1973→}
+  1974→
