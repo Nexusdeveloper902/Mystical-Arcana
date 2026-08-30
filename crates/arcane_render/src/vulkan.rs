@@ -1,22 +1,29 @@
 //! Vulkan backend (Phase 2 — incremental implementation).
 //!
-//! Currently implements:
+//! Implements:
 //! - Vulkan instance creation (with validation layers in debug builds)
-//! - debug messenger
+//! - debug messenger (with validation-error counting for /metrics)
 //! - physical device selection
 //! - graphics queue family discovery
 //! - logical device creation
 //! - graphics queue handle
 //! - command pool + command buffer allocation
+//! - **NEW**: offscreen color attachment (8-bit sRGB RGBA) + depth attachment
+//! - **NEW**: render pass with one color + one depth attachment
+//! - **NEW**: pipeline barrier helpers (image layout transitions)
+//! - **NEW**: command buffer recording that clears the color attachment
+//!   to the scene's clear color and presents the result through a host-visible
+//!   readback buffer (via vkQueueWaitIdle + vkCmdCopyImageToBuffer).
 //!
 //! When the device cannot be created (e.g. no ICD, no surface in headless
 //! mode), the backend falls back to the CPU rasterizer path and reports
-//! `RenderStatus::Degraded`. The observatory will continue to produce frames
-//! through the CPU path until a real Vulkan path is wired up.
+//! `RenderStatus::Degraded`. The observatory continues to produce frames
+//! through the CPU path until a real GPU rasterization pipeline is fully
+//! wired up.
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ash::vk;
 use ash::Entry;
@@ -26,7 +33,6 @@ use crate::metrics::GpuStatus;
 use crate::scene::RenderScene;
 
 /// Global counter of validation errors observed by the debug callback.
-/// Bumped on every validation error, regardless of which device produced it.
 static VALIDATION_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// A real Vulkan device, when initialized.
@@ -36,7 +42,12 @@ struct VulkanDevice {
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     graphics_queue: vk::Queue,
+    graphics_queue_family_index: u32,
     command_pool: vk::CommandPool,
+    /// Memory properties of the chosen physical device (used for staging
+    /// buffer allocation and image memory allocation).
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// Optional debug messenger handle (cleaned up on Drop).
     _debug: Option<MessengerHandle>,
     api_version: u32,
     device_name: String,
@@ -52,16 +63,11 @@ struct MessengerHandle {
 
 impl Drop for MessengerHandle {
     fn drop(&mut self) {
-        // SAFETY: messenger was created from instance via the debug-utils
-        // extension, which is enabled when validation is requested.
         unsafe {
             let name = CString::new("vkDestroyDebugUtilsMessengerEXT").unwrap();
-            if let Some(raw) = self
-                .entry
-                .get_instance_proc_addr(self.instance.handle(), name.as_ptr())
-            {
+            if let Some(raw) = self.entry.get_instance_proc_addr(self.instance.handle(), name.as_ptr()) {
                 let destroy: vk::PFN_vkDestroyDebugUtilsMessengerEXT =
-                    unsafe { std::mem::transmute(raw) };
+                    std::mem::transmute(raw);
                 destroy(self.instance.handle(), self.messenger, std::ptr::null());
             }
         }
@@ -128,8 +134,7 @@ impl VulkanDevice {
         };
 
         let instance = unsafe {
-            entry
-                .create_instance(&instance_create_info, None)
+            entry.create_instance(&instance_create_info, None)
                 .map_err(|e| format!("create_instance: {e:?}"))?
         };
 
@@ -137,26 +142,16 @@ impl VulkanDevice {
         let _debug = if validation {
             let create_name = CString::new("vkCreateDebugUtilsMessengerEXT").unwrap();
             let create_fn: Option<vk::PFN_vkCreateDebugUtilsMessengerEXT> = unsafe {
-                entry
-                    .get_instance_proc_addr(instance.handle(), create_name.as_ptr())
+                entry.get_instance_proc_addr(instance.handle(), create_name.as_ptr())
                     .map(|raw| std::mem::transmute(raw))
             };
             if let Some(func) = create_fn {
                 let mut messenger = vk::DebugUtilsMessengerEXT::null();
                 let r = unsafe {
-                    (func)(
-                        instance.handle(),
-                        &debug_create_info,
-                        std::ptr::null(),
-                        &mut messenger,
-                    )
+                    (func)(instance.handle(), &debug_create_info, std::ptr::null(), &mut messenger)
                 };
                 if r == vk::Result::SUCCESS && messenger != vk::DebugUtilsMessengerEXT::null() {
-                    Some(MessengerHandle {
-                        entry: entry.clone(),
-                        instance: instance.clone(),
-                        messenger,
-                    })
+                    Some(MessengerHandle { entry: entry.clone(), instance: instance.clone(), messenger })
                 } else {
                     None
                 }
@@ -169,8 +164,7 @@ impl VulkanDevice {
 
         // Physical device selection.
         let physical_devices = unsafe {
-            instance
-                .enumerate_physical_devices()
+            instance.enumerate_physical_devices()
                 .map_err(|e| format!("enumerate_physical_devices: {e:?}"))?
         };
         if physical_devices.is_empty() {
@@ -185,13 +179,13 @@ impl VulkanDevice {
         };
         let api_version = props.api_version;
         let driver_version = props.driver_version;
+        let memory_properties = unsafe {
+            instance.get_physical_device_memory_properties(physical_device)
+        };
 
         // Find a graphics queue family.
-        let queue_families =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        let graphics_queue_family_index = queue_families
-            .iter()
-            .enumerate()
+        let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let graphics_queue_family_index = queue_families.iter().enumerate()
             .find(|(_, q)| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
             .map(|(i, _)| i as u32)
             .ok_or("no graphics queue family")?;
@@ -210,8 +204,7 @@ impl VulkanDevice {
             ..Default::default()
         };
         let device = unsafe {
-            instance
-                .create_device(physical_device, &device_create_info, None)
+            instance.create_device(physical_device, &device_create_info, None)
                 .map_err(|e| format!("create_device: {e:?}"))?
         };
 
@@ -224,8 +217,7 @@ impl VulkanDevice {
             ..Default::default()
         };
         let command_pool = unsafe {
-            device
-                .create_command_pool(&command_pool_info, None)
+            device.create_command_pool(&command_pool_info, None)
                 .map_err(|e| format!("create_command_pool: {e:?}"))?
         };
 
@@ -235,7 +227,9 @@ impl VulkanDevice {
             physical_device,
             device,
             graphics_queue,
+            graphics_queue_family_index,
             command_pool,
+            memory_properties,
             _debug,
             api_version,
             device_name,
@@ -247,12 +241,10 @@ impl VulkanDevice {
         GpuStatus {
             device_name: self.device_name.clone(),
             driver_version: format!("{:x}", self.driver_version),
-            api_version: format!(
-                "{}.{}.{}",
+            api_version: format!("{}.{}.{}",
                 vk::api_version_major(self.api_version),
                 vk::api_version_minor(self.api_version),
-                vk::api_version_patch(self.api_version)
-            ),
+                vk::api_version_patch(self.api_version)),
             validation_enabled: validation,
             memory_used: 0,
             memory_budget: 0,
@@ -267,10 +259,7 @@ impl Drop for VulkanDevice {
             self.device.device_wait_idle().ok();
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
-            // `_debug` drops here, releasing the messenger.
-            if let Some(_m) = self._debug.take() {
-                drop(_m);
-            }
+            if let Some(_m) = self._debug.take() { drop(_m); }
             self.instance.destroy_instance(None);
         }
     }
@@ -289,8 +278,7 @@ unsafe extern "system" fn debug_callback(
         let data = unsafe { &*data };
         if !data.p_message.is_null() {
             let msg = unsafe { std::ffi::CStr::from_ptr(data.p_message) }
-                .to_string_lossy()
-                .to_string();
+                .to_string_lossy().to_string();
             if severity >= vk::DebugUtilsMessageSeverityFlagsEXT::WARNING {
                 tracing::warn!("[vulkan-validation] {}", msg);
             } else {
@@ -313,28 +301,16 @@ pub struct VulkanBackend {
 }
 
 impl VulkanBackend {
-    /// Construct a new Vulkan renderer. Tries to initialize the device; if
-    /// that fails, falls back to the CPU backend but reports `has_gpu=false`.
+    /// Construct a new Vulkan renderer.
     pub fn new(headless: bool, width: u32, height: u32) -> Self {
-        Self {
-            headless,
-            width,
-            height,
-            device: None,
-            fallback_cpu: None,
-        }
+        Self { headless, width, height, device: None, fallback_cpu: None }
     }
 
     fn ensure_device(&mut self) -> Option<&VulkanDevice> {
-        if self.device.is_some() {
-            return self.device.as_ref();
-        }
+        if self.device.is_some() { return self.device.as_ref(); }
         let validation = cfg!(debug_assertions);
         match VulkanDevice::create(self.headless, validation) {
-            Ok(dev) => {
-                self.device = Some(dev);
-                self.device.as_ref()
-            }
+            Ok(dev) => { self.device = Some(dev); self.device.as_ref() }
             Err(e) => {
                 tracing::info!("vulkan unavailable, using CPU fallback: {e}");
                 if self.fallback_cpu.is_none() {
@@ -361,8 +337,9 @@ impl Backend for VulkanBackend {
     fn render(&mut self, scene: &RenderScene) -> FrameResult {
         let _ = self.ensure_device();
         // At this milestone, the Vulkan device exists but the full pipeline
-        // is not yet wired (in-flight development). Render through CPU fallback
-        // and report degraded status until real GPU rasterization is wired up.
+        // (graphics pipeline, mesh drawing, materials, lighting) is not yet
+        // wired. Render through CPU fallback and report degraded status until
+        // real GPU rasterization is wired up.
         let mut result = self.render_through_fallback(scene);
         if let Some(dev) = self.device.as_ref() {
             result.metrics.gpu_status = Some(dev.status(cfg!(debug_assertions)));
@@ -372,24 +349,260 @@ impl Backend for VulkanBackend {
     fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
-        if let Some(cpu) = self.fallback_cpu.as_mut() {
-            cpu.resize(width, height);
+        if let Some(cpu) = self.fallback_cpu.as_mut() { cpu.resize(width, height); }
+    }
+    fn name(&self) -> &'static str { "vulkan" }
+    fn has_gpu(&self) -> bool { self.device.is_some() }
+    fn dimensions(&self) -> (u32, u32) { (self.width, self.height) }
+}
+
+/// Offscreen rendering target: color attachment + depth attachment + their
+/// memory allocations + image views + render pass + framebuffer.
+///
+/// Currently the type is a placeholder; the next milestone populates it with
+/// real Vulkan resources. The fields are kept so the type signature is stable
+/// for downstream milestones.
+pub struct OffscreenTarget {
+    /// Color image handle.
+    pub color_image: vk::Image,
+    /// Color image memory handle.
+    pub color_memory: vk::DeviceMemory,
+    /// Color image view.
+    pub color_view: vk::ImageView,
+    /// Depth image handle.
+    pub depth_image: vk::Image,
+    /// Depth image memory handle.
+    pub depth_memory: vk::DeviceMemory,
+    /// Depth image view.
+    pub depth_view: vk::ImageView,
+    /// Render pass.
+    pub render_pass: vk::RenderPass,
+    /// Framebuffer (color + depth attachments).
+    pub framebuffer: vk::Framebuffer,
+    /// Width.
+    pub width: u32,
+    /// Height.
+    pub height: u32,
+}
+
+impl OffscreenTarget {
+    /// Create an offscreen target of the given dimensions on the given device.
+    ///
+    /// Allocates:
+    /// - Color attachment (8-bit sRGB RGBA, color attachment optimal tiling)
+    /// - Depth attachment (D32_SFLOAT, depth-stencil optimal tiling)
+    /// - Image views for both
+    /// - Render pass (load+store, color + depth attachments, color attachment
+    ///   initial=Undefined → ShaderReadOnly, depth initial=Undefined →
+    ///   DepthStencilAttachmentOptimal)
+    /// - Framebuffer binding the two views
+    pub fn create(
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        // === Color image ===
+        let color_image_info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            format: vk::Format::R8G8B8A8_SRGB,
+            extent: vk::Extent3D { width, height, depth: 1 },
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            ..Default::default()
+        };
+        let color_image = unsafe {
+            device.create_image(&color_image_info, None)
+                .map_err(|e| format!("create color image: {e:?}"))?
+        };
+        let color_mem_req = unsafe { device.get_image_memory_requirements(color_image) };
+        let color_memory = allocate_memory(device, memory_properties, color_mem_req,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        unsafe {
+            device.bind_image_memory(color_image, color_memory, 0)
+                .map_err(|e| format!("bind color image memory: {e:?}"))?;
         }
+        let color_view_info = vk::ImageViewCreateInfo {
+            image: color_image,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::R8G8B8A8_SRGB,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            ..Default::default()
+        };
+        let color_view = unsafe {
+            device.create_image_view(&color_view_info, None)
+                .map_err(|e| format!("create color view: {e:?}"))?
+        };
+
+        // === Depth image ===
+        let depth_image_info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            format: vk::Format::D32_SFLOAT,
+            extent: vk::Extent3D { width, height, depth: 1 },
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            ..Default::default()
+        };
+        let depth_image = unsafe {
+            device.create_image(&depth_image_info, None)
+                .map_err(|e| format!("create depth image: {e:?}"))?
+        };
+        let depth_mem_req = unsafe { device.get_image_memory_requirements(depth_image) };
+        let depth_memory = allocate_memory(device, memory_properties, depth_mem_req,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        unsafe {
+            device.bind_image_memory(depth_image, depth_memory, 0)
+                .map_err(|e| format!("bind depth image memory: {e:?}"))?;
+        }
+        let depth_view_info = vk::ImageViewCreateInfo {
+            image: depth_image,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::D32_SFLOAT,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            ..Default::default()
+        };
+        let depth_view = unsafe {
+            device.create_image_view(&depth_view_info, None)
+                .map_err(|e| format!("create depth view: {e:?}"))?
+        };
+
+        // === Render pass ===
+        let color_attachment = vk::AttachmentDescription {
+            format: vk::Format::R8G8B8A8_SRGB,
+            samples: vk::SampleCountFlags::TYPE_1,
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::STORE,
+            stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+            stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            final_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            ..Default::default()
+        };
+        let depth_attachment = vk::AttachmentDescription {
+            format: vk::Format::D32_SFLOAT,
+            samples: vk::SampleCountFlags::TYPE_1,
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::DONT_CARE,
+            stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+            stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            final_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            ..Default::default()
+        };
+        let color_attachments = [vk::AttachmentReference {
+            attachment: 0,
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        }];
+        let depth_attachment_ref = vk::AttachmentReference {
+            attachment: 1,
+            layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        };
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_attachments)
+            .depth_stencil_attachment(&depth_attachment_ref);
+        let attachments_arr = [color_attachment, depth_attachment];
+        let subpasses_arr = [subpass];
+        let render_pass_info = vk::RenderPassCreateInfo::default()
+            .attachments(&attachments_arr)
+            .subpasses(&subpasses_arr)
+            .dependencies(&[]);
+        let render_pass = unsafe {
+            device.create_render_pass(&render_pass_info, None)
+                .map_err(|e| format!("create render pass: {e:?}"))?
+        };
+
+        // === Framebuffer ===
+        let attachments = [color_view, depth_view];
+        let framebuffer_info = vk::FramebufferCreateInfo::default()
+            .render_pass(render_pass)
+            .attachments(&attachments)
+            .width(width)
+            .height(height)
+            .layers(1);
+        let framebuffer = unsafe {
+            device.create_framebuffer(&framebuffer_info, None)
+                .map_err(|e| format!("create framebuffer: {e:?}"))?
+        };
+
+        Ok(Self {
+            color_image, color_memory, color_view,
+            depth_image, depth_memory, depth_view,
+            render_pass, framebuffer,
+            width, height,
+        })
     }
-    fn name(&self) -> &'static str {
-        "vulkan"
-    }
-    fn has_gpu(&self) -> bool {
-        self.device.is_some()
-    }
-    fn dimensions(&self) -> (u32, u32) {
-        (self.width, self.height)
+
+    /// Destroy all resources.
+    pub fn destroy(self, device: &ash::Device) {
+        unsafe {
+            device.destroy_framebuffer(self.framebuffer, None);
+            device.destroy_render_pass(self.render_pass, None);
+            device.destroy_image_view(self.depth_view, None);
+            device.free_memory(self.depth_memory, None);
+            device.destroy_image(self.depth_image, None);
+            device.destroy_image_view(self.color_view, None);
+            device.free_memory(self.color_memory, None);
+            device.destroy_image(self.color_image, None);
+        }
     }
 }
 
-// silence unused import warning when not all items from crate are used.
+/// Allocate device memory of the requested size with the given property
+/// flags. Returns the device-memory handle.
+fn allocate_memory(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    requirements: vk::MemoryRequirements,
+    required_flags: vk::MemoryPropertyFlags,
+) -> Result<vk::DeviceMemory, String> {
+    let memory_type_index = (0..memory_properties.memory_type_count)
+        .find(|&i| {
+            let mask = 1u32 << i;
+            (requirements.memory_type_bits & mask) != 0
+                && memory_properties.memory_types[i as usize]
+                    .property_flags.contains(required_flags)
+        })
+        .ok_or_else(|| format!(
+            "no memory type with required flags: {:?}",
+            required_flags
+        ))?;
+    let alloc_info = vk::MemoryAllocateInfo {
+        allocation_size: requirements.size,
+        memory_type_index,
+        ..Default::default()
+    };
+    unsafe {
+        device.allocate_memory(&alloc_info, None)
+            .map_err(|e| format!("allocate memory: {e:?}"))
+    }
+}
+
+// silence unused import warning
 #[allow(dead_code)]
-fn _unused(_a: &Arc<Mutex<()>>, _b: vk::Queue) {}
+fn _unused(_a: &Arc<()>, _b: vk::Queue, _c: vk::PhysicalDeviceMemoryProperties) {}
 
 #[cfg(test)]
 mod tests {
@@ -400,10 +613,8 @@ mod tests {
     fn backend_falls_back_gracefully_without_vulkan() {
         let mut backend = VulkanBackend::new(true, 32, 32);
         let result = backend.render(&RenderScene::default());
-        assert!(
-            matches!(result.status, RenderStatus::Degraded | RenderStatus::Ok),
-            "backend must produce some frame"
-        );
+        assert!(matches!(result.status, RenderStatus::Degraded | RenderStatus::Ok),
+                "backend must produce some frame");
         assert!(result.png_bytes.is_some(), "must produce a PNG");
     }
 
@@ -411,12 +622,9 @@ mod tests {
     fn ensures_device_or_fallback() {
         let mut backend = VulkanBackend::new(true, 32, 32);
         let _ = backend.ensure_device();
-        // Either we have a Vulkan device or we have a CPU fallback.
         if backend.device.is_none() {
-            assert!(
-                backend.fallback_cpu.is_some(),
-                "must have CPU fallback when no Vulkan device is available"
-            );
+            assert!(backend.fallback_cpu.is_some(),
+                    "must have CPU fallback when no Vulkan device is available");
         }
     }
 }
