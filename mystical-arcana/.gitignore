@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
+/build/
 **/*.rs.bk
+**/target/
+**/build/
 
 # IDE / editor
 .idea/
@@ -14,3 +17,4 @@ Thumbs.db
 
 # Tooling artifacts
 /tool-results/
+mystical-arcana.git/

@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/z/my-project/mystical-arcana/build/_deps/corrosion-subbuild/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
