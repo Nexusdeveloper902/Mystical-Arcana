@@ -36,17 +36,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ron = "0.8"
-postcard = { version = "1", features = ["alloc"] }
+postcard = { version = "1", features = ["use-std"] }
 bincode = "1"
 
 # === Math ===
-nalgebra = { version = "0.33", features = ["serde-serialize"] }
-nalgebra-glm = "0.19"
-glam = { version = "0.27", features = ["serde"] }
+nalgebra = { version = "0.34", features = ["serde-serialize"] }
+nalgebra-glm = "0.21"
+glam = { version = "0.29", features = ["serde"] }
 
 # === Error handling ===
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # === Concurrency ===
 rayon = "1"
@@ -55,7 +55,7 @@ parking_lot = "0.12"
 atomic_refcell = "0.1"
 
 # === Collections / utilities ===
-hashbrown = { version = "0.14", features = ["serde"] }
+hashbrown = { version = "0.15", features = ["serde"] }
 ahash = "0.8"
 smallvec = { version = "1", features = ["serde", "union", "const_generics"] }
 bitflags = { version = "2", features = ["serde"] }
@@ -64,22 +64,24 @@ once_cell = "1"
 indexmap = { version = "2", features = ["serde"] }
 
 # === Rendering (Vulkan) ===
-ash = "0.37"
-ash-window = "0.12"
-winit = "0.29"
-gpu-allocator = "0.26"
+ash = "0.38"
+ash-window = "0.13"
+winit = "0.30"
+gpu-allocator = "0.27"
+# Render Observatory (browser-accessible HTTP server for visual feedback)
+tiny_http = "0.12"
 
 # === Assets ===
 gltf = { version = "1", features = ["utils"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
-meshopt = "0.2"
+meshopt = "0.4" # placeholder
 
 # === Audio ===
-kira = "0.8"
-rodio = { version = "0.17", default-features = false, features = ["vorbis"] }
+kira = "0.10"
+rodio = { version = "0.19", default-features = false, features = ["vorbis"] }
 
 # === Physics ===
-rapier3d = { version = "0.18", features = ["serde-serialize"] }
+rapier3d = { version = "0.23", features = ["serde-serialize"] }
 
 # === Input ===
 gilrs = "0.10"

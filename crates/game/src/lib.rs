@@ -45,6 +45,20 @@ pub mod world;
 /// Used by `Tests/smoke_headless.rs` and CI.
 pub mod headless;
 
+/// Top-level CLI parser + runner. Handles `--observatory`, `--visualize`,
+/// `--scenario`, `--output`, `--backend`, etc., alongside the legacy
+/// `--smoke` gameplay-loop path.
+pub mod cli;
+/// Deterministic visual-test scenarios (`empty_scene`, `basic_scene`,
+/// `terrain_scene`, `player_scene`, `mana_node_scene`, `combat_scene`,
+/// `building_scene`, `corruption_scene`).
+pub mod scenario;
+/// Live game session: ties the Arcane renderer + player snapshot + particle
+/// list + UI frame together. Produces a `RenderScene` each frame.
+pub mod session;
+/// Render extraction: bridges the session to the renderer's `RenderScene`.
+pub mod extract;
+
 #[cfg(test)]
 mod tests {
     use super::*;
