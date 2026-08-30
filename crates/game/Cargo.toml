@@ -42,6 +42,10 @@ thiserror = { workspace = true }
 hashbrown = { workspace = true }
 ahash = { workspace = true }
 smallvec = { workspace = true }
+parking_lot = { workspace = true }
+nalgebra = { workspace = true }
+pico-args = "0.5"
+image = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

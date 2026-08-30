@@ -6,12 +6,33 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Arcane engine: arcane_render"
+description = "Arcane engine: renderer (CPU software backend + Vulkan backend + Render Observatory)"
 
 [lib]
 name = "arcane_render"
 path = "src/lib.rs"
 
 [dependencies]
+arcane_core = { path = "../arcane_core" }
+arcane_math = { path = "../arcane_math" }
+nalgebra = { workspace = true }
+bytemuck = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+rayon = { workspace = true }
+bitflags = { workspace = true }
+ahash = { workspace = true }
+once_cell = { workspace = true }
+image = { workspace = true }
+ash = { workspace = true }
+ash-window = { workspace = true }
+winit = { workspace = true }
+tiny_http = "0.12"
 
-[dev-dependencies]
+[features]
+default = ["vulkan"]
+vulkan = []
