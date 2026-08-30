@@ -64,3 +64,43 @@ Stage Summary:
 - All 13 workspace crates compile, all tests pass, the binary runs cleanly under gdb, and the rendered frame is verifiably a triangle (not a blank clear).
 - Deliverables in `/home/z/my-project/download/`: `mystical_arcana_first_frame.png` (79 KB, 800×600 RGBA) and `mystical_arcana_first_frame.raw` (1.92 MB, 800×600 BGRA).
 - Next steps (not done yet, future work): real first-person camera + mesh buffers for world geometry + depth testing + lighting + shadows + mana system. The Vulkan plumbing is now in place to grow those incrementally.
+
+---
+Task ID: 2-main-rewrite
+Agent: main (super-z)
+Task: Push the working renderer forward (build was already clean — no real crash to fix); clean up residual warnings in arcane_render/src/lib.rs; rewrite crates/game/src/main.rs to be a substantive game entry point with env-var-driven frame cap, MYSTICAL_FOREVER mode, validation_failed() check, SIGINT clean shutdown, and richer per-second logging; run cargo test workspace-wide; commit to git main.
+
+Work Log:
+- Verified the build was actually green from the prior session: `cargo build --release --bin mystical_arcana` finishes in ~20s with only 4 cosmetic warnings (unused import `ash::vk::Handle`, unused `ctx` param, `let _ = create_info.push_next(...)`, `mut` on InstanceCreateInfo). The "7 API fixes" listed in the prior session summary were already in the lib.rs on disk — they were not redos, they were the existing state.
+- Smoke-tested the binary under lavapipe: 60 frames in ~50 ms, no validation errors, Observatory published a 1.92 MB BGRA8 buffer (800×600×4) per frame. PNG endpoint returned a 79 KB valid PNG.
+- Verified pixel content is a real triangle: 47,436 unique BGRA tuples, clear color BGRA=(20,13,13,255) matches the configured (0.05,0.05,0.08,1.0) clear; triangle edges show interpolated colors like BGRA=(1,250,4) (vertex 2 = green corner).
+- Cleaned up the 4 lib.rs warnings:
+  * removed unused `ash::vk::Handle` import
+  * dropped `mut` on InstanceCreateInfo binding
+  * discarded push_next return via `let _ = ...`
+  * prefixed the unused `ctx` param in `acquire_next_image` with `_` (kept in signature for future swapchain-recreation paths)
+  * removed nested `unsafe` block around the `mvp_bytes` slice construction
+- Added `Backend::with_observatory(width, height, addr)` constructor in lib.rs so main.rs can pick the Observatory bind address via `MYSTICAL_OBSERVATORY` env var; `Backend::new` now delegates to it with the default `0.0.0.0:8080`.
+- Rewrote `crates/game/src/main.rs`:
+  * New module-level docstring explains run modes (env-driven) and exit codes (0 clean / 1 init / 2 validation / 3 render errors)
+  * Reads `MYSTICAL_WIDTH`, `MYSTICAL_HEIGHT`, `MYSTICAL_FRAMES` (default 60), `MYSTICAL_FOREVER`, `MYSTICAL_OBSERVATORY`, `MYSTICAL_WARMUP_MS` env vars
+  * Calls `Backend::with_observatory()` instead of `Backend::new()`
+  * Installs a SIGINT handler via `signal-hook` crate (canonical Rust signal handling). The handler just flips a `static AtomicBool STOP`; the render loop polls STOP between frames so Vulkan destructors still run (device_wait_idle → destroy_*) before process exit.
+  * Checks `arcane_render::validation_failed()` after every `render_one` — if the validation layer fired an ERROR, log it, drop the backend explicitly (so Drop runs), and exit 2.
+  * Counts render errors; after 3 consecutive errors aborts with exit 3 (so a stuck pipeline doesn't spin forever).
+  * Logs per-second FPS with error/validation counters: `rendered {N} frames in {T}s (~{FPS} fps); errors={E} validation_fails={V}`.
+  * After the loop, optionally stays alive for `MYSTICAL_WARMUP_MS` (default 2000) so the browser can fetch the final frame from the Observatory.
+  * Final `drop(backend)` runs the Vulkan destructor sequence in the correct reverse-construction order.
+- Initial attempt used `libc::signal` directly with a function-pointer cast — built cleanly but SIGINT never fired the handler in practice. Switched to `signal-hook` crate's `low_level::register` (which uses `sigaction` under the hood). The first `signal-hook` attempt used `flag::register` which requires `Arc<AtomicBool>`; switched to `low_level::register` with a closure that just does the atomic store (works with `static AtomicBool`, no heap allocation).
+- Debugging the SIGINT handler: initial test "failed" because the test script used `cmd1 && cmd2 && binary &` which makes bash background a subshell, so `$!` was bash's PID, not the binary's. Once the test script was restructured to run `source` and `cd` in the foreground shell before backgrounding only the binary, `$!` correctly identified the binary PID and SIGINT fired the handler as expected. `/proc/PID/status` confirmed `Name: mystical_arcana` and `SigCgt` had the SIGINT bit set.
+- Final smoke test: `MYSTICAL_FOREVER=1 ./target/release/mystical_arcana` rendered at ~960 fps on lavapipe; SIGINT at t=2 s cleanly broke the loop with the log line "SIGINT received; finishing frame 1870 and tearing down Vulkan"; Observatory stayed alive for the warmup window; Vulkan destructors ran; process exited 0 cleanly.
+- Ran `cargo test --release --workspace`: all 23 test targets pass (all are 0-test placeholder crates, but the test runner reports `test result: ok. 0 passed; 0 failed` for each).
+
+Stage Summary:
+- Build: `cargo build --release --bin mystical_arcana` finishes in ~20 s with only 2 pre-existing `arcane_ecs` dead-code warnings (not from this task).
+- Run: 60-frame smoke test produces a real rendered triangle on lavapipe with no validation errors. The Observatory at http://0.0.0.0:8080/ serves `/` (HTML viewer), `/frame.png` (79 KB PNG), `/frame.raw` (1.92 MB BGRA8), `/debug/state` (JSON metadata).
+- SIGINT: Ctrl-C cleanly breaks the render loop, runs Vulkan destructors, exits 0. (SIGTERM still kills via default disposition since we don't register for it — that's intentional, gives users a "force kill" path.)
+- Validation: any ERROR from the Khronos validation layer sets a global atomic that the loop checks every frame; on hit, drops the backend and exits 2.
+- Render errors: tolerated up to 3 consecutive before exit 3 (gives lavapipe's occasional transient `VK_ERROR_OUT_OF_DATE_KHR` on the first frame a chance to recover).
+- Deliverables in `/home/z/my-project/download/`: `mystical_arcana_frame.png` (79 KB, 800×600 RGBA) and `mystical_arcana_frame.raw` (1.92 MB, 800×600 BGRA) — both produced by the real Vulkan pipeline (no fallbacks, no smoke-test stubs).
+- Next steps (future work): real first-person camera + mesh buffers for world geometry + depth testing + lighting + shadows + mana system. The Vulkan plumbing and the game-loop scaffold are now both in place to grow those incrementally.

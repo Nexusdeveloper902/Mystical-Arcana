@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use ash::ext::{debug_utils, headless_surface};
 use ash::vk;
-use ash::vk::Handle;
 use parking_lot::Mutex;
 use tiny_http::{Header, Response, Server};
 
@@ -208,7 +207,7 @@ impl VkContext {
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_3);
 
-        let mut create_info = vk::InstanceCreateInfo::default()
+        let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_layer_names(&layers_ptrs)
             .enabled_extension_names(&ext_ptrs);
@@ -228,7 +227,7 @@ impl VkContext {
             .pfn_user_callback(Some(messenger_callback));
             // Some(fn_item) coerces to Option<PFN_...>. If the types differ in
             // mutability, we use as `unsafe extern "system" fn(...)` directly.
-        create_info.push_next(&mut debug_create);
+        let _ = create_info.push_next(&mut debug_create);
 
         let instance = unsafe {
             entry.create_instance(&create_info, None)
@@ -916,9 +915,13 @@ impl HeadlessSwapchain {
 
     pub fn acquire_next_image(
         &self,
-        ctx: &VkContext,
+        _ctx: &VkContext,
         semaphore: vk::Semaphore,
     ) -> RenderResult<u32> {
+        // The Vulkan acquire call lives on `swapchain_loader`, which already
+        // holds a reference to the logical device. The `ctx` parameter is kept
+        // in the signature so future swapchain-recreation paths can consult the
+        // physical-device capabilities when the surface is invalidated.
         unsafe {
             match self.swapchain_loader.acquire_next_image(self.raw, u64::MAX, semaphore, vk::Fence::null()) {
                 Ok((idx, _suboptimal)) => Ok(idx),
@@ -937,6 +940,11 @@ impl HeadlessSwapchain {
             self.swapchain_loader.queue_present(ctx.graphics_queue, &present_info)
                 .map_err(|e| RenderError::Present(format!("{:?}", e)))?;
         }
+        // `ctx` is required by the API surface even though we only need the
+        // graphics queue (which lives on `ctx`). Keep it explicit so future
+        // multi-queue variants can plug in here without rewriting the
+        // signature.
+        let _ = ctx;
         Ok(())
     }
 }
@@ -1265,6 +1273,18 @@ pub struct Backend {
 
 impl Backend {
     pub fn new(width: u32, height: u32) -> RenderResult<Self> {
+        Self::with_observatory(width, height, "0.0.0.0:8080")
+    }
+
+    /// Same as [`Backend::new`] but lets the caller pick the Observatory bind
+    /// address. Pass e.g. `"127.0.0.1:9999"` to scope to localhost and a
+    /// non-default port, or `"0.0.0.0:8080"` (the default) to expose to the
+    /// host network.
+    pub fn with_observatory(
+        width: u32,
+        height: u32,
+        observatory_addr: &str,
+    ) -> RenderResult<Self> {
         let ctx = VkContext::new("Mystical Arcana", cfg!(debug_assertions))?;
         log::info!("Vulkan context: device = {}", ctx.device_name());
 
@@ -1278,7 +1298,7 @@ impl Backend {
             2,
         )?;
         let mesh = TriangleMesh::new(&ctx)?;
-        let observatory = Observatory::start("0.0.0.0:8080");
+        let observatory = Observatory::start(observatory_addr);
 
         let bytes_needed = (width as u64) * (height as u64) * 4;
         let readback = Buffer::new(
@@ -1395,12 +1415,10 @@ impl Backend {
             self.ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline.pipeline);
             self.ctx.device.cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.mesh.vertex.raw), &[0]);
             self.ctx.device.cmd_bind_index_buffer(cmd, self.mesh.index.raw, 0, vk::IndexType::UINT16);
-            let mvp_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    mvp.as_ptr() as *const u8,
-                    std::mem::size_of::<[f32; 16]>(),
-                )
-            };
+            let mvp_bytes: &[u8] = std::slice::from_raw_parts(
+                mvp.as_ptr() as *const u8,
+                std::mem::size_of::<[f32; 16]>(),
+            );
             self.ctx.device.cmd_push_constants(
                 cmd,
                 self.pipeline.pipeline_layout,

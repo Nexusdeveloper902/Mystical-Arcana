@@ -25,3 +25,4 @@ arcane_input = { path = "../arcane_input" }
 arcane_ui = { path = "../arcane_ui" }
 arcane_vfx = { path = "../arcane_vfx" }
 arcane_physics = { path = "../arcane_physics" }
+signal-hook.workspace = true

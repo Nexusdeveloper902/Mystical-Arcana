@@ -55,6 +55,8 @@ tiny_http = "0.12"
 ahash = "0.8"
 # Compile-time resources for the binary
 rust-embed = { version = "8", features = ["compression"] }
+# signal-hook — reliable cross-platform signal handling (SIGINT for clean shutdown)
+signal-hook = "0.3"
 
 [profile.release]
 debug = true  # Keep debug symbols for stack traces even in release builds

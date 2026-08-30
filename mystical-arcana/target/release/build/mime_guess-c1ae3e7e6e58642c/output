@@ -1,1 +1,0 @@
-cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/home/z/my-project/mystical-arcana/target/release/build/mime_guess-c1ae3e7e6e58642c/out/mime_types_generated.rs
