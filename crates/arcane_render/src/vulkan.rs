@@ -24,6 +24,7 @@
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use ash::vk;
 use ash::Entry;
@@ -295,6 +296,8 @@ pub struct VulkanBackend {
     width: u32,
     height: u32,
     device: Option<VulkanDevice>,
+    /// Offscreen rendering target (created on first render, recreated on resize).
+    offscreen: Option<OffscreenTarget>,
     /// When Vulkan is unavailable (e.g. no ICD), we fall back to the CPU
     /// rasterizer so the observatory still produces a meaningful frame.
     fallback_cpu: Option<crate::cpu::CpuBackend>,
@@ -303,7 +306,7 @@ pub struct VulkanBackend {
 impl VulkanBackend {
     /// Construct a new Vulkan renderer.
     pub fn new(headless: bool, width: u32, height: u32) -> Self {
-        Self { headless, width, height, device: None, fallback_cpu: None }
+        Self { headless, width, height, device: None, offscreen: None, fallback_cpu: None }
     }
 
     fn ensure_device(&mut self) -> Option<&VulkanDevice> {
@@ -321,6 +324,21 @@ impl VulkanBackend {
         }
     }
 
+    /// Ensure the offscreen target exists for the current resolution.
+    fn ensure_offscreen(&mut self) -> Result<(), String> {
+        if self.offscreen.as_ref().map_or(false, |t| t.width == self.width && t.height == self.height) {
+            return Ok(());
+        }
+        let device = match self.device.as_ref() { Some(d) => d, None => return Err("no device".into()) };
+        // Destroy the old target if dimensions changed.
+        if let Some(old) = self.offscreen.take() {
+            old.destroy(&device.device);
+        }
+        let target = OffscreenTarget::create(&device.device, &device.memory_properties, self.width, self.height)?;
+        self.offscreen = Some(target);
+        Ok(())
+    }
+
     fn render_through_fallback(&mut self, scene: &RenderScene) -> FrameResult {
         if self.fallback_cpu.is_none() {
             self.fallback_cpu = Some(crate::cpu::CpuBackend::new(self.width, self.height));
@@ -331,25 +349,239 @@ impl VulkanBackend {
         result.metrics.backend = "vulkan-fallback-cpu".to_string();
         result
     }
+
+    /// Real Vulkan render path: record a clear into the offscreen target,
+    /// submit, read back the framebuffer to a host-visible buffer, encode
+    /// as PNG.
+    ///
+    /// Returns `Err` if the path can't complete (e.g. no host-visible memory
+    /// type available for readback, command recording fails).
+    fn render_offscreen(&mut self, scene: &RenderScene) -> Result<Vec<u8>, String> {
+        let device_obj = match self.device.as_ref() { Some(d) => d, None => return Err("no device".into()) };
+        let target = match self.offscreen.as_ref() { Some(t) => t, None => return Err("no offscreen target".into()) };
+        let device = &device_obj.device;
+
+        // === Allocate a primary command buffer ===
+        let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(device_obj.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffer = unsafe {
+            device.allocate_command_buffers(&cmd_alloc_info)
+                .map_err(|e| format!("alloc cmd buf: {e:?}"))?
+        };
+        let command_buffer = command_buffer[0];
+
+        // === Begin recording ===
+        let clear_color = vk::ClearColorValue {
+            float32: [scene.clear_color[0], scene.clear_color[1], scene.clear_color[2], scene.clear_color[3]],
+        };
+        let clear_depth = vk::ClearDepthStencilValue {
+            depth: 1.0,
+            stencil: 0,
+        };
+        let clear_values = [
+            vk::ClearValue { color: clear_color },
+            vk::ClearValue { depth_stencil: clear_depth },
+        ];
+        let render_begin = vk::RenderPassBeginInfo::default()
+            .render_pass(target.render_pass)
+            .framebuffer(target.framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width: target.width, height: target.height },
+            })
+            .clear_values(&clear_values);
+
+        let cmd_begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            device.begin_command_buffer(command_buffer, &cmd_begin)
+                .map_err(|e| format!("begin cmd buf: {e:?}"))?;
+            device.cmd_begin_render_pass(command_buffer, &render_begin, vk::SubpassContents::INLINE);
+            // End immediately — we only have a clear so far.
+            device.cmd_end_render_pass(command_buffer);
+            device.end_command_buffer(command_buffer)
+                .map_err(|e| format!("end cmd buf: {e:?}"))?;
+        }
+
+        // === Submit and wait ===
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&command_buffer));
+        unsafe {
+            device.queue_submit(device_obj.graphics_queue, std::slice::from_ref(&submit_info), vk::Fence::null())
+                .map_err(|e| format!("queue submit: {e:?}"))?;
+            device.queue_wait_idle(device_obj.graphics_queue)
+                .map_err(|e| format!("queue wait idle: {e:?}"))?;
+        }
+
+        // === Readback: create a host-visible buffer, copy the color image
+        // into it, map the memory, encode as PNG. ===
+        // Compute image layout transitions and readback buffer size.
+        let buffer_size = (target.width * target.height * 4) as vk::DeviceSize;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(buffer_size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let readback_buffer = unsafe {
+            device.create_buffer(&buffer_info, None)
+                .map_err(|e| format!("create readback buf: {e:?}"))?
+        };
+        let buf_mem_req = unsafe { device.get_buffer_memory_requirements(readback_buffer) };
+        let readback_memory = allocate_memory(device, &device_obj.memory_properties, buf_mem_req,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?;
+        unsafe {
+            device.bind_buffer_memory(readback_buffer, readback_memory, 0)
+                .map_err(|e| format!("bind readback buf memory: {e:?}"))?;
+        }
+
+        // Record a second command buffer to transition the color image layout
+        // to TransferSrcOptimal and copy it to the readback buffer.
+        let cmd2 = unsafe {
+            device.allocate_command_buffers(&cmd_alloc_info)
+                .map_err(|e| format!("alloc cmd buf 2: {e:?}"))?
+        };
+        let cmd2 = cmd2[0];
+        unsafe {
+            device.begin_command_buffer(cmd2, &cmd_begin)
+                .map_err(|e| format!("begin cmd2: {e:?}"))?;
+
+            // Transition color image layout: from whatever the render pass
+            // left it in (TRANSFER_SRC_OPTIMAL, per the attachment description)
+            // to TRANSFER_SRC_OPTIMAL (no-op in this case, but the barrier
+            // is required for safety).
+            let image_barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(target.color_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            device.cmd_pipeline_barrier(
+                cmd2,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::default(),
+                &[],
+                &[],
+                std::slice::from_ref(&image_barrier),
+            );
+
+            // Copy image → buffer.
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(target.width)
+                .buffer_image_height(target.height)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D { width: target.width, height: target.height, depth: 1 });
+            device.cmd_copy_image_to_buffer(
+                cmd2,
+                target.color_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                readback_buffer,
+                std::slice::from_ref(&region),
+            );
+
+            device.end_command_buffer(cmd2)
+                .map_err(|e| format!("end cmd2: {e:?}"))?;
+        }
+
+        let submit_info2 = vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&cmd2));
+        unsafe {
+            device.queue_submit(device_obj.graphics_queue, std::slice::from_ref(&submit_info2), vk::Fence::null())
+                .map_err(|e| format!("queue submit 2: {e:?}"))?;
+            device.queue_wait_idle(device_obj.graphics_queue)
+                .map_err(|e| format!("queue wait idle 2: {e:?}"))?;
+        }
+
+        // === Map and read ===
+        let png_bytes = unsafe {
+            let ptr = device.map_memory(readback_memory, 0, buffer_size as vk::DeviceSize, vk::MemoryMapFlags::default())
+                .map_err(|e| format!("map memory: {e:?}"))?;
+            let slice = std::slice::from_raw_parts(ptr as *const u8, buffer_size as usize);
+            // The image is R8G8B8A8_SRGB; the bytes are already sRGB-encoded.
+            crate::png::encode_rgba(target.width, target.height, slice)
+                .map_err(|e| format!("png encode: {e}"))?;
+            device.unmap_memory(readback_memory);
+            crate::png::encode_rgba(target.width, target.height, slice)
+                .map_err(|e| format!("png encode 2: {e}"))?
+        };
+
+        // === Cleanup per-frame resources ===
+        unsafe {
+            device.destroy_buffer(readback_buffer, None);
+            device.free_memory(readback_memory, None);
+            device.free_command_buffers(device_obj.command_pool, &[command_buffer, cmd2]);
+        }
+
+        Ok(png_bytes)
+    }
 }
 
 impl Backend for VulkanBackend {
     fn render(&mut self, scene: &RenderScene) -> FrameResult {
         let _ = self.ensure_device();
-        // At this milestone, the Vulkan device exists but the full pipeline
-        // (graphics pipeline, mesh drawing, materials, lighting) is not yet
-        // wired. Render through CPU fallback and report degraded status until
-        // real GPU rasterization is wired up.
-        let mut result = self.render_through_fallback(scene);
-        if let Some(dev) = self.device.as_ref() {
-            result.metrics.gpu_status = Some(dev.status(cfg!(debug_assertions)));
+        // Try the real Vulkan path: record a clear into the offscreen target,
+        // submit, readback to CPU, encode as PNG. If anything fails, fall
+        // back to the CPU rasterizer.
+        if self.device.is_some() {
+            if let Err(e) = self.ensure_offscreen() {
+                tracing::warn!("offscreen target creation failed: {e}");
+                return self.render_through_fallback(scene);
+            }
+            match self.render_offscreen(scene) {
+                Ok(png_bytes) => {
+                    use std::time::Instant;
+                    let start = Instant::now();
+                    let elapsed_us = start.elapsed().as_micros() as u64;
+                    return FrameResult {
+                        png_bytes: Some(png_bytes),
+                        status: RenderStatus::Degraded, // still degraded: only clears, no geometry.
+                        metrics: crate::metrics::Metrics {
+                            backend: "vulkan".to_string(),
+                            width: self.width,
+                            height: self.height,
+                            frame_time_us: elapsed_us,
+                            draw_calls: 0,
+                            triangles: 0,
+                            visible_objects: 0,
+                            loaded_meshes: 0,
+                            loaded_textures: 0,
+                            active_materials: 0,
+                            gpu_status: self.device.as_ref().map(|d| d.status(cfg!(debug_assertions))),
+                            ..Default::default()
+                        },
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!("vulkan offscreen render failed: {e}; using CPU fallback");
+                    return self.render_through_fallback(scene);
+                }
+            }
         }
-        result
+        // No device; use CPU fallback.
+        self.render_through_fallback(scene)
     }
     fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
         if let Some(cpu) = self.fallback_cpu.as_mut() { cpu.resize(width, height); }
+        // Offscreen target will be recreated on next render.
     }
     fn name(&self) -> &'static str { "vulkan" }
     fn has_gpu(&self) -> bool { self.device.is_some() }
